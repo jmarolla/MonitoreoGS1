@@ -1,9 +1,8 @@
 # app.py — Monitor de Sitios (Mosaico) para Streamlit Cloud
 # ---------------------------------------------------------
-# - Miniaturas Playwright en hilo (to_thread) sin bloquear asyncio
-# - Fuerza usar Chromium "chrome" y lo instala en ./.pw-browsers (no ~/.cache)
-# - Si falta o falla, reintenta y hace fallback (headless_shell como último recurso)
-# - HTTP/2 (fallback a HTTP/1.1), SSL days, autorefresh, import/export, prueba de miniatura
+# - Miniaturas Playwright en hilo (to_thread). Instala en ./.pw-browsers y usa executable_path.
+# - Si Playwright falla (binario ausente, permisos, etc.), cae a captura por API (mShots).
+# - HTTP/2 (fallback HTTP/1.1), SSL days, autorefresh, import/export, prueba de miniatura.
 
 import asyncio
 import contextlib
@@ -16,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 import os
 import glob
 import subprocess
+import urllib.parse
 
 import httpx
 import streamlit as st
@@ -100,11 +100,31 @@ def _install_chromium(prefer_chrome: bool = True) -> Optional[str]:
         ["python", "-m", "playwright", "install", "chromium", "--force"],
         check=False, capture_output=True, text=True, env=env
     )
-    # Si falla la instalación, dejamos una pista
     if proc.returncode != 0:
         st.caption("Miniatura: install stderr → " + (proc.stderr or "")[:250])
 
     return _find_chrome_exec()
+
+
+async def _screenshot_via_api(url: str, width: int, timeout: int = 12_000) -> Optional[bytes]:
+    """
+    Fallback sin navegador: usa mShots (WordPress) para obtener una miniatura.
+    No requiere clave. Si falla, probamos un 2º endpoint (thum.io).
+    """
+    qurl = urllib.parse.quote(url, safe="")
+    endpoints = [
+        f"https://s.wordpress.com/mshots/v1/{qurl}?w={width}",               # 1) mShots
+        f"https://image.thum.io/get/width/{width}/{url}",                    # 2) thum.io (sin clave, best effort)
+    ]
+    async with httpx.AsyncClient(timeout=timeout/1000, follow_redirects=True) as c:
+        for ep in endpoints:
+            try:
+                r = await c.get(ep)
+                if r.status_code == 200 and r.content:
+                    return r.content
+            except Exception:
+                continue
+    return None
 
 
 # ===== Captura Playwright (sync) ejecutada en hilo ============================
@@ -226,8 +246,9 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
         pass
     days_ssl = ssl_days_left(host) if host else None
 
-    # Miniatura en hilo (evita "Sync API inside asyncio loop")
+    # Miniatura: Playwright → si falla, API
     if st.session_state.get("thumb_on"):
+        # 1) Intento Playwright en hilo
         img, t_err = await asyncio.to_thread(
             capture_thumbnail_sync,
             url,
@@ -237,7 +258,17 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
             st.session_state.get("timeout_ms", 10000),
             int(time.time() // max(1, st.session_state.get("refresh_sec", 30))),
         )
-        thumb, thumb_err = img, t_err
+        if img:
+            thumb = img
+        else:
+            thumb_err = t_err or "Playwright desconocido"
+            # 2) Fallback API (sin navegador)
+            api_img = await _screenshot_via_api(url, st.session_state.get("viewport_w", 420))
+            if api_img:
+                thumb = api_img
+                # señalamos en el error que usamos API
+                thumb_err = "miniatura vía API (fallback)"
+            # si tampoco hay API, dejamos thumb en None y mostramos el error de Playwright
 
     return (
         {
@@ -329,7 +360,13 @@ with st.sidebar:
                 st.success("¡Anduvo!")
                 st.image(img, caption="Prueba de miniatura")
             elif t_err:
-                st.error(f"Miniatura: {t_err}")
+                # Intento API en la prueba también
+                api_img = asyncio.run(_screenshot_via_api(test_url, st.session_state.get("viewport_w", 420)))
+                if api_img:
+                    st.info("Playwright falló; mostrando miniatura vía API (fallback).")
+                    st.image(api_img, caption="Prueba (API)")
+                else:
+                    st.error(f"Miniatura: {t_err}")
 
 
 # ===== Header & autorefresh ===================================================
