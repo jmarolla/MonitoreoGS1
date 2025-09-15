@@ -6,7 +6,7 @@
 # - Normaliza URLs sin esquema (agrega https://).
 # - Chequeo de SSL (días restantes).
 # - Importar/exportar lista de sitios.
-# - Botón de prueba de miniatura y mensajes de error visibles.
+# - Captura Playwright ejecutada en HILO (to_thread) para evitar conflictos con asyncio.
 
 import asyncio
 import contextlib
@@ -14,7 +14,6 @@ import datetime as dt
 import socket
 import ssl
 import time
-import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -37,6 +36,7 @@ st.markdown(
 .badge.err{background:#ef444422; border:1px solid #dc262644}
 .url-line{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size:0.8rem; word-break:break-all}
 .small{font-size:0.8rem; opacity:0.85}
+.errtxt{font-size:0.85rem; opacity:0.9; margin:0 0 6px 0}
 </style>
 """,
     unsafe_allow_html=True,
@@ -65,16 +65,17 @@ def ssl_days_left(hostname: str, port: int = 443, timeout: float = 5.0) -> Optio
         return None
     return None
 
-@st.cache_data(show_spinner=False, ttl=60)  # renovamos cada 60s
-def capture_thumbnail(url: str, width: int, height: int, wait_until: str, timeout_ms: int, cache_bust: int) -> Optional[bytes]:
-    """Toma una miniatura con Playwright/Chromium.
-       Incluye flags para contenedores de Streamlit Cloud.
-       'cache_bust' fuerza recachear para que no se quede pegado un None viejo."""
+# ---- Captura de miniatura (SINCRÓNICA) ejecutada en hilo ----
+@st.cache_data(show_spinner=False, ttl=60)
+def capture_thumbnail_sync(url: str, width: int, height: int, wait_until: str, timeout_ms: int, cache_bust: int) -> Tuple[Optional[bytes], Optional[str]]:
+    """
+    Devuelve (imagen_bytes, error_str). Se ejecuta en un hilo con asyncio.to_thread().
+    cache_bust participa de la clave de caché para evitar que quede pegado un None viejo.
+    """
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:
-        st.caption(f"Miniatura: Playwright no disponible ({str(e)[:100]})")
-        return None
+        return None, f"Playwright no disponible: {str(e)[:100]}"
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -89,12 +90,10 @@ def capture_thumbnail(url: str, width: int, height: int, wait_until: str, timeou
             page.goto(url, wait_until=wait_until, timeout=timeout_ms)
             img = page.screenshot(full_page=False)
             context.close(); browser.close()
-            return img
+            return img, None
     except Exception as e:
-        st.caption("Miniatura: " + (str(e)[:200] or "error desconocido"))
-        # Para debug profundo, descomenta:
-        # st.text_area("trace", traceback.format_exc(), height=120)
-        return None
+        # Ejemplos: "It looks like you are using Playwright Sync API inside the asyncio loop..."
+        return None, str(e)[:200]
 
 @dataclass
 class Timings:
@@ -108,6 +107,8 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
     timings = Timings()
     status = None
     error = None
+    thumb_err = None
+    thumb = None
 
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=20)
 
@@ -136,6 +137,7 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
         finally:
             timings.total_ms = (time.perf_counter() - start) * 1000.0
 
+    # SSL days
     host = None
     try:
         host = httpx.URL(url).host
@@ -143,19 +145,28 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
         pass
     days_ssl = ssl_days_left(host) if host else None
 
-    thumb = None
+    # Thumbnail en hilo (evita "Sync API en asyncio loop")
     if st.session_state.get("thumb_on"):
-        thumb = capture_thumbnail(
+        img, t_err = await asyncio.to_thread(
+            capture_thumbnail_sync,
             url,
             st.session_state.get("viewport_w", 420),
             st.session_state.get("viewport_h", 280),
             st.session_state.get("wait_until", "load"),
             st.session_state.get("timeout_ms", 10000),
-            cache_bust=int(time.time() // max(1, st.session_state.get("refresh_sec", 30)))
+            int(time.time() // max(1, st.session_state.get("refresh_sec", 30))),
         )
+        thumb, thumb_err = img, t_err
 
     return (
-        {"url": url, "status": status, "error": error, "timings": timings.__dict__, "ssl_days": days_ssl},
+        {
+            "url": url,
+            "status": status,
+            "error": error,
+            "timings": timings.__dict__,
+            "ssl_days": days_ssl,
+            "thumb_error": thumb_err,
+        },
         thumb,
     )
 
@@ -222,17 +233,19 @@ with st.sidebar:
         st.subheader("🧪 Probar miniatura")
         test_url = st.selectbox("Elegí un sitio", st.session_state.sites, key="test_url")
         if st.button("Probar captura", use_container_width=True):
-            img = capture_thumbnail(
+            img, t_err = capture_thumbnail_sync(
                 test_url,
                 st.session_state.get("viewport_w", 420),
                 st.session_state.get("viewport_h", 280),
                 st.session_state.get("wait_until", "load"),
                 st.session_state.get("timeout_ms", 10000),
-                cache_bust=int(time.time())
+                int(time.time())
             )
             if img:
                 st.success("¡Anduvo!")
                 st.image(img, caption="Prueba de miniatura")
+            elif t_err:
+                st.error(f"Miniatura: {t_err}")
 
 # ---- Header ----
 st.title("🧭 Monitor de Sitios — Mosaico")
@@ -267,6 +280,7 @@ for _ in range(rows):
         error = data["error"]
         t = data["timings"] or {}
         ssl_days = data["ssl_days"]
+        thumb_error = data.get("thumb_error")
 
         total = t.get("total_ms") or 0
         ttfb = t.get("ttfb_ms")
@@ -302,8 +316,11 @@ for _ in range(rows):
             st.markdown('<div class="card">', unsafe_allow_html=True)
             st.markdown(f"<h4>{badge} {perf_badge} {ssl_badge}</h4>", unsafe_allow_html=True)
             st.markdown(f"<div class='url-line'>{url}</div>", unsafe_allow_html=True)
+
             if thumb is not None:
                 st.image(thumb, use_column_width=True, caption="miniatura")
+            elif thumb_error:
+                st.markdown(f"<p class='errtxt'>Miniatura: {thumb_error}</p>", unsafe_allow_html=True)
             else:
                 st.markdown("<div class='small'>Miniatura desactivada o no disponible.</div>", unsafe_allow_html=True)
 
