@@ -2,7 +2,7 @@
 # -------------------------------------------------
 # - Mosaico 3x3 con miniaturas (Playwright opcional), estado HTTP y métricas.
 # - Refresco automático con streamlit-autorefresh.
-# - HTTP/2 habilitado (httpx[http2] + h2 + hpack + hyperframe).
+# - HTTP/2 habilitado (httpx[http2] + h2 + hpack + hyperframe) con fallback a HTTP/1.1.
 # - Normaliza URLs sin esquema (agrega https://).
 # - Chequeo de SSL (días restantes).
 # - Importar/exportar lista de sitios.
@@ -65,14 +65,22 @@ def ssl_days_left(hostname: str, port: int = 443, timeout: float = 5.0) -> Optio
 
 @st.cache_data(show_spinner=False)
 def capture_thumbnail(url: str, width: int, height: int, wait_until: str, timeout_ms: int) -> Optional[bytes]:
+    """Toma una miniatura con Playwright/Chromium.
+       Incluye flags para contenedores de Streamlit Cloud."""
     try:
         from playwright.sync_api import sync_playwright
     except Exception:
         return None
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(viewport={"width": width, "height": height})
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            context = browser.new_context(
+                viewport={"width": width, "height": height},
+                device_scale_factor=1.0,
+            )
             page = context.new_page()
             page.goto(url, wait_until=wait_until, timeout=timeout_ms)
             img = page.screenshot(full_page=False)
@@ -97,7 +105,7 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
 
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=20)
 
-    # Probamos HTTP/2; si el entorno no soporta, caemos a HTTP/1.1
+    # Intentar HTTP/2; si no hay soporte, caer a HTTP/1.1
     try:
         client = httpx.AsyncClient(http2=True, limits=limits, timeout=timeout, follow_redirects=True)
     except Exception:
