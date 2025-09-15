@@ -6,6 +6,7 @@
 # - Normaliza URLs sin esquema (agrega https://).
 # - Chequeo de SSL (días restantes).
 # - Importar/exportar lista de sitios.
+# - Botón de prueba de miniatura y mensajes de error visibles.
 
 import asyncio
 import contextlib
@@ -13,6 +14,7 @@ import datetime as dt
 import socket
 import ssl
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -63,13 +65,15 @@ def ssl_days_left(hostname: str, port: int = 443, timeout: float = 5.0) -> Optio
         return None
     return None
 
-@st.cache_data(show_spinner=False)
-def capture_thumbnail(url: str, width: int, height: int, wait_until: str, timeout_ms: int) -> Optional[bytes]:
+@st.cache_data(show_spinner=False, ttl=60)  # renovamos cada 60s
+def capture_thumbnail(url: str, width: int, height: int, wait_until: str, timeout_ms: int, cache_bust: int) -> Optional[bytes]:
     """Toma una miniatura con Playwright/Chromium.
-       Incluye flags para contenedores de Streamlit Cloud."""
+       Incluye flags para contenedores de Streamlit Cloud.
+       'cache_bust' fuerza recachear para que no se quede pegado un None viejo."""
     try:
         from playwright.sync_api import sync_playwright
-    except Exception:
+    except Exception as e:
+        st.caption(f"Miniatura: Playwright no disponible ({str(e)[:100]})")
         return None
     try:
         with sync_playwright() as p:
@@ -84,10 +88,12 @@ def capture_thumbnail(url: str, width: int, height: int, wait_until: str, timeou
             page = context.new_page()
             page.goto(url, wait_until=wait_until, timeout=timeout_ms)
             img = page.screenshot(full_page=False)
-            context.close()
-            browser.close()
+            context.close(); browser.close()
             return img
-    except Exception:
+    except Exception as e:
+        st.caption("Miniatura: " + (str(e)[:200] or "error desconocido"))
+        # Para debug profundo, descomenta:
+        # st.text_area("trace", traceback.format_exc(), height=120)
         return None
 
 @dataclass
@@ -145,6 +151,7 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
             st.session_state.get("viewport_h", 280),
             st.session_state.get("wait_until", "load"),
             st.session_state.get("timeout_ms", 10000),
+            cache_bust=int(time.time() // max(1, st.session_state.get("refresh_sec", 30)))
         )
 
     return (
@@ -168,6 +175,8 @@ if not st.session_state.sites and "urls" in st.query_params:
 with st.sidebar:
     st.header("⚙️ Controles")
     refresh_sec = st.number_input("Refrescar cada (seg)", min_value=5, max_value=300, value=30, step=5)
+    st.session_state["refresh_sec"] = refresh_sec
+
     st.session_state["thumb_on"] = st.toggle("Miniaturas (Playwright)", value=False, help="Activalo para ver capturas.")
     st.session_state["wait_until"] = st.selectbox(
         "Estrategia de carga", ["load", "domcontentloaded", "networkidle"], index=0
@@ -207,12 +216,30 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Error importando: {e}")
 
+    # ---- Probar miniatura manualmente ----
+    if st.session_state.sites:
+        st.divider()
+        st.subheader("🧪 Probar miniatura")
+        test_url = st.selectbox("Elegí un sitio", st.session_state.sites, key="test_url")
+        if st.button("Probar captura", use_container_width=True):
+            img = capture_thumbnail(
+                test_url,
+                st.session_state.get("viewport_w", 420),
+                st.session_state.get("viewport_h", 280),
+                st.session_state.get("wait_until", "load"),
+                st.session_state.get("timeout_ms", 10000),
+                cache_bust=int(time.time())
+            )
+            if img:
+                st.success("¡Anduvo!")
+                st.image(img, caption="Prueba de miniatura")
+
 # ---- Header ----
 st.title("🧭 Monitor de Sitios — Mosaico")
 st.caption("Miniaturas opcionales con métricas de tiempo y certificado SSL. Ideal para 3×3.")
 
 # ---- Autorefresh ----
-_ = st_autorefresh(interval=refresh_sec * 1000, key="refresh_timer")
+_ = st_autorefresh(interval=st.session_state.get("refresh_sec", 30) * 1000, key="refresh_timer")
 
 # ---- Main ----
 if not st.session_state.sites:
