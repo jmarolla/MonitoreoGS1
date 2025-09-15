@@ -1,0 +1,6 @@
+streamlit
+httpx
+playwright
+cryptography
+certifi
+streamlit-autorefresh

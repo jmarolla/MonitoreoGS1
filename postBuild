@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -e
+
+# Instala el navegador Chromium para Playwright
+python -m playwright install chromium
+
+# (Opcional) Verifica versión por logs
+python -c "import playwright; import sys; print('Playwright OK:', playwright.__version__); sys.exit(0)"
