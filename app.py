@@ -1,7 +1,8 @@
 # app.py — Monitor de Sitios (Mosaico) para Streamlit Cloud
 # ---------------------------------------------------------
-# - Miniaturas Playwright en hilo (sin bloquear asyncio)
-# - Fuerza usar chromium "chrome" (no headless_shell) y reinstala si falta
+# - Miniaturas Playwright en hilo (to_thread) sin bloquear asyncio
+# - Fuerza usar Chromium "chrome" y lo instala en ./.pw-browsers (no ~/.cache)
+# - Si falta o falla, reintenta y hace fallback (headless_shell como último recurso)
 # - HTTP/2 (fallback a HTTP/1.1), SSL days, autorefresh, import/export, prueba de miniatura
 
 import asyncio
@@ -12,15 +13,15 @@ import ssl
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-import subprocess
 import os
 import glob
+import subprocess
 
 import httpx
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-# ---------- Config ----------
+# ===== Config de página =======================================================
 st.set_page_config(page_title="Monitor de Sitios (Mosaico)", page_icon="🧭", layout="wide")
 
 st.markdown(
@@ -40,7 +41,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---------- Helpers ----------
+# Carpeta local para los binarios de Playwright (evita ~/.cache)
+BROWSERS_DIR = os.path.abspath("./.pw-browsers")
+os.makedirs(BROWSERS_DIR, exist_ok=True)
+
+
+# ===== Helpers ================================================================
 def normalize_url(u: str) -> str:
     u = (u or "").strip()
     if not u:
@@ -48,6 +54,7 @@ def normalize_url(u: str) -> str:
     if not u.startswith(("http://", "https://")):
         return "https://" + u
     return u
+
 
 def ssl_days_left(hostname: str, port: int = 443, timeout: float = 5.0) -> Optional[int]:
     try:
@@ -63,16 +70,18 @@ def ssl_days_left(hostname: str, port: int = 443, timeout: float = 5.0) -> Optio
         return None
     return None
 
-# Preferimos el binario "chrome" (no headless_shell)
+
 def _find_chrome_exec() -> Optional[str]:
+    """Busca el ejecutable de Chromium. Primero en ./.pw-browsers, luego en ~/.cache."""
     roots = [
+        BROWSERS_DIR,
         os.environ.get("PLAYWRIGHT_BROWSERS_PATH"),
         os.path.expanduser("~/.cache/ms-playwright"),
     ]
-    # 1) chromium "normal"
-    patterns = ["chromium-*/chrome-linux/chrome"]
-    # 2) como último recurso, headless_shell
-    patterns += ["chromium_headless_shell-*/chrome-linux/headless_shell"]
+    patterns = [
+        "chromium-*/chrome-linux/chrome",                        # preferido
+        "chromium_headless_shell-*/chrome-linux/headless_shell"  # último recurso
+    ]
     for root in [r for r in roots if r]:
         for pat in patterns:
             for path in glob.glob(os.path.join(root, pat)):
@@ -80,18 +89,25 @@ def _find_chrome_exec() -> Optional[str]:
                     return path
     return None
 
-def _install_chromium(prefer_chrome=True) -> Optional[str]:
+
+def _install_chromium(prefer_chrome: bool = True) -> Optional[str]:
+    """Instala Chromium dentro de ./.pw-browsers y devuelve la ruta del ejecutable."""
     env = os.environ.copy()
-    # Forzamos a NO usar headless_shell
-    if prefer_chrome:
-        env["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "0"
-    subprocess.run(
+    env["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_DIR
+    env["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "0" if prefer_chrome else "1"
+
+    proc = subprocess.run(
         ["python", "-m", "playwright", "install", "chromium", "--force"],
         check=False, capture_output=True, text=True, env=env
     )
+    # Si falla la instalación, dejamos una pista
+    if proc.returncode != 0:
+        st.caption("Miniatura: install stderr → " + (proc.stderr or "")[:250])
+
     return _find_chrome_exec()
 
-# ---------- Captura Playwright (sync) ejecutada en hilo ----------
+
+# ===== Captura Playwright (sync) ejecutada en hilo ============================
 @st.cache_data(show_spinner=False, ttl=60)
 def capture_thumbnail_sync(
     url: str,
@@ -99,19 +115,21 @@ def capture_thumbnail_sync(
     height: int,
     wait_until: str,
     timeout_ms: int,
-    cache_bust: int,
+    cache_bust: int,  # participa en la clave de caché para no pegarse a un None viejo
 ) -> Tuple[Optional[bytes], Optional[str]]:
     """
     Devuelve (imagen_bytes, error_str).
-    - Fuerza PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL=0
-    - Busca el ejecutable 'chrome', instala si falta y lanza con executable_path
+    - Usa Chromium en ./.pw-browsers (instala si falta)
+    - Lanza con executable_path explícito
+    - Fallback a headless_shell sólo si es lo único disponible
     """
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:
         return None, f"Playwright no disponible: {str(e)[:120]}"
 
-    # Siempre preferimos chromium "chrome"
+    # Preferimos chrome en nuestra carpeta local
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_DIR
     os.environ["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "0"
 
     def _launch_with(exec_path: Optional[str]) -> bytes:
@@ -134,29 +152,30 @@ def capture_thumbnail_sync(
             context.close(); browser.close()
             return img
 
-    # 1) Buscamos ejecutable y lanzamos
+    # 1) Buscar ejecutable actual y lanzar
     exec_path = _find_chrome_exec()
     try:
         return _launch_with(exec_path), None
     except Exception as e1:
-        msg1 = str(e1)
-        # 2) Instalamos y reintentamos con executable_path explícito
+        # 2) Instalar chrome en ./.pw-browsers y reintentar
         exec_path = _install_chromium(prefer_chrome=True) or _find_chrome_exec()
         if exec_path:
             try:
                 return _launch_with(exec_path), None
             except Exception as e2:
-                return None, f"Instalado pero no pude lanzar (chrome): {str(e2)[:200]}"
-        # 3) Último recurso: permitir headless_shell si es lo único disponible
-        os.environ["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "1"
-        exec_path = _install_chromium(prefer_chrome=False) or _find_chrome_exec()
-        if exec_path:
-            try:
-                return _launch_with(exec_path), None
-            except Exception as e3:
-                return None, f"Instalado (headless_shell) pero falló: {str(e3)[:200]}"
-        return None, f"No encontré binario tras instalar: {msg1[:160]}"
+                # 3) Último recurso: permitir headless_shell y reintentar
+                os.environ["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "1"
+                exec_path = _install_chromium(prefer_chrome=False) or _find_chrome_exec()
+                if exec_path:
+                    try:
+                        return _launch_with(exec_path), None
+                    except Exception as e3:
+                        return None, f"Instalado (headless_shell) pero falló: {str(e3)[:200]}"
+                return None, f"No encontré binario tras instalar en {BROWSERS_DIR}: {str(e2)[:160]}"
+        return None, f"No encontré binario tras instalar en {BROWSERS_DIR}: {str(e1)[:160]}"
 
+
+# ===== Monitoreo HTTP =========================================================
 @dataclass
 class Timings:
     dns_ms: Optional[float] = None
@@ -165,7 +184,7 @@ class Timings:
     ttfb_ms: Optional[float] = None
     total_ms: Optional[float] = None
 
-# ---------- Monitoreo ----------
+
 async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[bytes]]:
     timings = Timings()
     status = None
@@ -175,7 +194,7 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
 
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=20)
 
-    # Intentar HTTP/2; si no hay soporte, caer a HTTP/1.1
+    # HTTP/2 si se puede; sino HTTP/1.1
     try:
         client = httpx.AsyncClient(http2=True, limits=limits, timeout=timeout, follow_redirects=True)
     except Exception:
@@ -184,7 +203,6 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
     async with client as c:
         start = time.perf_counter()
         try:
-            # TTFB aprox: abrimos stream y medimos hasta el primer chunk
             async with c.stream("GET", url) as r:
                 status = r.status_code
                 try:
@@ -208,7 +226,7 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
         pass
     days_ssl = ssl_days_left(host) if host else None
 
-    # Miniatura en hilo
+    # Miniatura en hilo (evita "Sync API inside asyncio loop")
     if st.session_state.get("thumb_on"):
         img, t_err = await asyncio.to_thread(
             capture_thumbnail_sync,
@@ -233,11 +251,13 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
         thumb,
     )
 
+
 async def run_monitor(urls: List[str]) -> List[Tuple[Dict, Optional[bytes]]]:
     tasks = [monitor_once(u) for u in urls]
     return await asyncio.gather(*tasks)
 
-# ---------- Estado ----------
+
+# ===== Estado inicial =========================================================
 if "sites" not in st.session_state:
     st.session_state.sites: List[str] = []
 
@@ -245,7 +265,8 @@ if "sites" not in st.session_state:
 if not st.session_state.sites and "urls" in st.query_params:
     st.session_state.sites = [normalize_url(u) for u in st.query_params.get("urls", "").split(",") if u]
 
-# ---------- Sidebar ----------
+
+# ===== Sidebar ================================================================
 with st.sidebar:
     st.header("⚙️ Controles")
     refresh_sec = st.number_input("Refrescar cada (seg)", min_value=5, max_value=300, value=30, step=5)
@@ -262,19 +283,19 @@ with st.sidebar:
     st.divider()
     st.subheader("➕ Agregar sitio")
     new_url = st.text_input("URL", placeholder="https://tu-sitio.com")
-    col_add1, col_add2 = st.columns([1, 1])
-    with col_add1:
+    c1, c2 = st.columns([1, 1])
+    with c1:
         if st.button("Agregar", use_container_width=True) and new_url:
             new_url = normalize_url(new_url)
             if new_url not in st.session_state.sites:
                 st.session_state.sites.append(new_url)
                 st.query_params["urls"] = ",".join(st.session_state.sites)
-    with col_add2:
+    with c2:
         if st.button("Limpiar lista", use_container_width=True):
             st.session_state.sites = []
             st.query_params.clear()
 
-    st.caption("Tip: podés compartir la app con ?urls=a,b,c para precargar.")
+    st.caption("Tip: compartí la app con ?urls=a,b,c para precargar.")
 
     st.divider()
     st.subheader("⬆️⬇️ Importar / Exportar")
@@ -290,7 +311,7 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Error importando: {e}")
 
-    # ---- Probar miniatura manualmente ----
+    # Prueba manual de miniatura
     if st.session_state.sites:
         st.divider()
         st.subheader("🧪 Probar miniatura")
@@ -310,14 +331,15 @@ with st.sidebar:
             elif t_err:
                 st.error(f"Miniatura: {t_err}")
 
-# ---------- Header ----------
+
+# ===== Header & autorefresh ===================================================
 st.title("🧭 Monitor de Sitios — Mosaico")
 st.caption("Miniaturas opcionales con métricas de tiempo y certificado SSL. Ideal para 3×3.")
 
-# ---------- Autorefresh ----------
 _ = st_autorefresh(interval=st.session_state.get("refresh_sec", 30) * 1000, key="refresh_timer")
 
-# ---------- Main ----------
+
+# ===== Main ===================================================================
 if not st.session_state.sites:
     st.info("Agregá una o más URLs desde la barra lateral para empezar 🧉")
     st.stop()
