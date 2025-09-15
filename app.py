@@ -2,7 +2,7 @@
 # ---------------------------------------------------------
 # - Mosaico 3x3 con miniaturas (Playwright opcional), estado HTTP y métricas.
 # - HTTP/2 via httpx[http2] con fallback a HTTP/1.1.
-# - Captura Playwright en hilo (to_thread) + auto-install si falta Chromium.
+# - Captura Playwright en hilo (to_thread) + auto-fix de binario (chromium/headless_shell).
 # - URLs normalizadas, SSL days, autorefresh, import/export y prueba de miniatura.
 
 import asyncio
@@ -14,6 +14,8 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import subprocess
+import os
+import glob
 
 import httpx
 import streamlit as st
@@ -62,6 +64,36 @@ def ssl_days_left(hostname: str, port: int = 443, timeout: float = 5.0) -> Optio
         return None
     return None
 
+def _find_any_chromium_path() -> Optional[str]:
+    """Busca chrome/headless_shell en los lugares típicos."""
+    roots = [
+        os.environ.get("PLAYWRIGHT_BROWSERS_PATH"),
+        os.path.expanduser("~/.cache/ms-playwright"),
+    ]
+    patterns = [
+        "chromium-*/chrome-linux/chrome",
+        "chromium_headless_shell-*/chrome-linux/headless_shell",
+    ]
+    for root in [r for r in roots if r]:
+        for pat in patterns:
+            for path in glob.glob(os.path.join(root, pat)):
+                if os.path.exists(path) and os.access(path, os.X_OK):
+                    return path
+    return None
+
+def _ensure_chromium_installed(force_normal_chromium: bool = False) -> Optional[str]:
+    """Instala el navegador si falta y devuelve la ruta al ejecutable."""
+    env = os.environ.copy()
+    if force_normal_chromium:
+        # Forzamos a NO usar headless_shell
+        env["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "0"
+    # Instalamos chromium (Playwright decidirá qué artefacto usar según env)
+    subprocess.run(
+        ["python", "-m", "playwright", "install", "chromium", "--force"],
+        check=False, capture_output=True, text=True, env=env
+    )
+    return _find_any_chromium_path()
+
 # ---------- Captura Playwright (sync) ejecutada en hilo ----------
 @st.cache_data(show_spinner=False, ttl=60)
 def capture_thumbnail_sync(
@@ -73,7 +105,10 @@ def capture_thumbnail_sync(
     cache_bust: int,
 ) -> Tuple[Optional[bytes], Optional[str]]:
     """
-    Devuelve (imagen_bytes, error_str). Instala Chromium si falta y reintenta una vez.
+    Devuelve (imagen_bytes, error_str).
+    - Detecta binario (chromium o headless_shell) y lo usa.
+    - Si falta, instala y reintenta. Si buscaba headless_shell y no aparece,
+      fuerza instalación de chromium "normal" y reintenta con executable_path.
     'cache_bust' participa de la clave de caché (evita pegarse a un None viejo).
     """
     try:
@@ -81,13 +116,13 @@ def capture_thumbnail_sync(
     except Exception as e:
         return None, f"Playwright no disponible: {str(e)[:100]}"
 
-    def _launch_and_shoot():
+    def _launch_and_shoot(exec_path: Optional[str] = None):
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"]
-            )
+            kwargs = dict(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            if exec_path:
+                kwargs["executable_path"] = exec_path
+            browser = p.chromium.launch(**kwargs)
             context = browser.new_context(
                 viewport={"width": width, "height": height},
                 device_scale_factor=1.0,
@@ -98,25 +133,27 @@ def capture_thumbnail_sync(
             context.close(); browser.close()
             return img
 
-    # Primer intento
+    # 1) Intento directo (por si ya está instalado y bien)
     try:
-        return _launch_and_shoot(), None
-    except Exception as e:
-        msg = str(e)
-        # Si falta el ejecutable, intentamos instalar Chromium y reintentamos
-        if "Executable doesn't exist" in msg or "No usable browsers" in msg or "executable" in msg.lower():
+        return _launch_and_shoot(None), None
+    except Exception as e1:
+        msg1 = str(e1)
+        # 2) Si falta ejecutable, intentar instalar lo que sea y reintentar sin path
+        if "Executable doesn't exist" in msg1 or "No usable browsers" in msg1 or "executable" in msg1.lower():
+            path = _ensure_chromium_installed(force_normal_chromium=False)
             try:
-                subprocess.run(
-                    ["python", "-m", "playwright", "install", "chromium", "--force"],
-                    check=False, capture_output=True, text=True
-                )
-                try:
-                    return _launch_and_shoot(), None
-                except Exception as e2:
-                    return None, f"Instalado, pero falló al lanzar: {str(e2)[:200]}"
-            except Exception as ie:
-                return None, f"No pude instalar Chromium: {str(ie)[:200]}"
-        return None, msg[:200]
+                return _launch_and_shoot(None), None
+            except Exception as e2:
+                msg2 = str(e2)
+                # 3) Si insiste buscando headless_shell, forzar chromium normal y reintentar con executable_path
+                if ("chromium_headless_shell" in msg2) or ("Executable doesn't exist" in msg2):
+                    path = path or _ensure_chromium_installed(force_normal_chromium=True)
+                    try:
+                        return _launch_and_shoot(exec_path=path), None
+                    except Exception as e3:
+                        return None, f"Instalado pero no pude lanzar: {str(e3)[:200]}"
+                return None, msg2[:200]
+        return None, msg1[:200]
 
 @dataclass
 class Timings:
