@@ -1,10 +1,15 @@
-# app.py — Monitor de Sitios (Mosaico) para Streamlit Cloud
-# ---------------------------------------------------------
-# - Miniaturas Playwright en hilo (to_thread), instala en ./.pw-browsers y lanza con executable_path
-# - Si Playwright falla, fallback a miniatura vía API (mShots / thum.io)
-# - HTTP/2 (fallback HTTP/1.1), SSL days, autorefresh, importar/exportar, prueba manual
+# app.py — Monitor de Sitios + Journeys (Playwright) — Streamlit Cloud
+# -------------------------------------------------------------------
+# - Miniaturas Playwright (con instalación local ./.pw-browsers) + fallback API (mShots/thum.io)
+# - HTTP/2 con fallback, métricas, SSL days, autorefresh, importar/exportar URLs
 # - Mejoras: badge PW/API, filtro “solo problemas”, color por SSL, reglas de contenido,
 #            histórico en memoria + CSV, alertas a Microsoft Teams con cooldown
+# - Journeys: flujos con Playwright (goto/fill/click/wait/expect_text/screenshot/sleep)
+#
+# Requiere (opcionalmente) en Secrets:
+#   TEAMS_WEBHOOK="https://outlook.office.com/webhook/..."
+#   BOT_USER="usuario@example.com"
+#   BOT_PASS="super-secreta"
 
 import asyncio
 import contextlib
@@ -20,13 +25,14 @@ import subprocess
 import urllib.parse
 import csv
 import io
+import json
 
 import httpx
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 # ===== Config de página =======================================================
-st.set_page_config(page_title="Monitor de Sitios (Mosaico)", page_icon="🧭", layout="wide")
+st.set_page_config(page_title="Monitor de Sitios + Journeys", page_icon="🧭", layout="wide")
 
 st.markdown(
     """
@@ -100,7 +106,7 @@ def _install_chromium(prefer_chrome: bool = True) -> Optional[str]:
         check=False, capture_output=True, text=True, env=env
     )
     if proc.returncode != 0:
-        st.caption("Miniatura: install stderr → " + (proc.stderr or "")[:250])
+        st.caption("Miniatura/Journey: install stderr → " + (proc.stderr or "")[:250])
     return _find_chrome_exec()
 
 async def _screenshot_via_api(url: str, width: int, timeout: int = 12_000) -> Optional[bytes]:
@@ -318,11 +324,155 @@ def _should_alert(key: tuple, cooldown_sec=900):
         return True
     return False
 
+# ===== Journeys: definición y helpers =========================================
+# Variables se escriben como ${BOT_USER}, ${BOT_PASS} y vienen de st.secrets o env.
+JOURNEYS = {
+    # Ejemplo de plantilla: login simple + dashboard
+    "backoffice_login_demo": [
+        {"op": "goto", "url": "https://tu-dominio/login"},
+        {"op": "fill", "selector": "input[type=email]", "value": "${BOT_USER}"},
+        {"op": "fill", "selector": "input[type=password]", "value": "${BOT_PASS}"},
+        {"op": "click", "selector": "button[type=submit]"},
+        {"op": "wait_for", "selector": "#dashboard", "timeout": 15000},
+        {"op": "screenshot", "label": "dashboard"},
+    ],
+}
+
+SENSITIVE_KEYS = ("PASS", "TOKEN", "SECRET", "KEY", "PWD")
+
+def _substitute_vars(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    out = text
+    # Primero secrets de Streamlit
+    for k, v in (st.secrets or {}).items():
+        out = out.replace(f"${{{k}}}", str(v))
+    # Luego env
+    for k, v in os.environ.items():
+        out = out.replace(f"${{{k}}}", str(v))
+    return out
+
+def _mask_value(val: str) -> str:
+    if not isinstance(val, str):
+        return val
+    up = val.upper()
+    if any(s in up for s in SENSITIVE_KEYS):
+        return "********"
+    return "********" if len(val) > 0 else val
+
+@st.cache_data(show_spinner=True, ttl=0)  # corre siempre que se dispare
+def run_journey_sync(steps: list, viewport=(1280, 800), default_timeout_ms=15000) -> dict:
+    """
+    Ejecuta un journey con Playwright (sync) y devuelve:
+    {"ok":bool, "error":str|None, "log":[...], "screens":[(label, bytes), ...]}
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        return {"ok": False, "error": f"Playwright no disponible: {e}", "log": [], "screens": []}
+
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_DIR
+    os.environ["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "0"
+
+    log = []
+    screens = []
+
+    def _log(op, detail, ok=True):
+        log.append({"op": op, "detail": detail, "ok": ok})
+
+    exec_path = _find_chrome_exec()
+    if not exec_path:
+        exec_path = _install_chromium(prefer_chrome=True) or _find_chrome_exec()
+    if not exec_path:
+        os.environ["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "1"
+        exec_path = _install_chromium(prefer_chrome=False) or _find_chrome_exec()
+    if not exec_path:
+        return {"ok": False, "error": "No encontré binario Chromium", "log": log, "screens": []}
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                executable_path=exec_path,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            context = browser.new_context(viewport={"width": viewport[0], "height": viewport[1]}, device_scale_factor=1.0)
+            page = context.new_page()
+            page.set_default_timeout(default_timeout_ms)
+
+            for i, raw_step in enumerate(steps):
+                step = {k: _substitute_vars(v) if isinstance(v, str) else v for k, v in raw_step.items()}
+                op = (step.get("op") or "").lower().strip()
+
+                try:
+                    if op == "goto":
+                        url = step["url"]
+                        page.goto(url, wait_until=step.get("wait_until", "load"), timeout=step.get("timeout", default_timeout_ms))
+                        _log("goto", f"{url}")
+
+                    elif op == "wait_for":
+                        sel = step["selector"]
+                        page.wait_for_selector(sel, state=step.get("state", "visible"), timeout=step.get("timeout", default_timeout_ms))
+                        _log("wait_for", f"{sel}")
+
+                    elif op == "wait_network_idle":
+                        page.wait_for_load_state("networkidle", timeout=step.get("timeout", default_timeout_ms))
+                        _log("wait_network_idle", "ok")
+
+                    elif op == "fill":
+                        sel = step["selector"]
+                        val = step["value"]
+                        page.fill(sel, val)
+                        _log("fill", f"{sel} = { _mask_value(val) }")
+
+                    elif op == "press":
+                        sel = step["selector"]
+                        keys = step["keys"]
+                        page.press(sel, keys)
+                        _log("press", f"{sel} <- {keys}")
+
+                    elif op == "click":
+                        sel = step["selector"]
+                        page.click(sel)
+                        _log("click", f"{sel}")
+
+                    elif op == "expect_text":
+                        text = step["text"]
+                        page.get_by_text(text, exact=False).wait_for(timeout=step.get("timeout", default_timeout_ms))
+                        _log("expect_text", f"{_mask_value(text)}")
+
+                    elif op == "screenshot":
+                        label = step.get("label", f"step_{i}")
+                        img = page.screenshot(full_page=step.get("full_page", False))
+                        screens.append((label, img))
+                        _log("screenshot", label)
+
+                    elif op == "sleep":
+                        ms = int(step.get("ms", 1000))
+                        page.wait_for_timeout(ms)
+                        _log("sleep", f"{ms} ms")
+
+                    else:
+                        _log("unknown", f"Operación no soportada: {op}", ok=False)
+                        context.close(); browser.close()
+                        return {"ok": False, "error": f"Operación no soportada: {op}", "log": log, "screens": screens}
+
+                except Exception as se:
+                    _log(op, f"ERROR: {se}", ok=False)
+                    context.close(); browser.close()
+                    return {"ok": False, "error": str(se), "log": log, "screens": screens}
+
+            context.close(); browser.close()
+            return {"ok": True, "error": None, "log": log, "screens": screens}
+
+    except Exception as e:
+        return {"ok": False, "error": f"No pude lanzar Chromium: {e}", "log": log, "screens": screens}
+
 # ===== Estado inicial =========================================================
 if "sites" not in st.session_state:
     st.session_state.sites: List[str] = []
 
-# Cargar desde querystring
+# Cargar desde querystring (si existe)
 if not st.session_state.sites and "urls" in st.query_params:
     st.session_state.sites = [normalize_url(u) for u in st.query_params.get("urls", "").split(",") if u]
 
@@ -381,31 +531,6 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Error importando: {e}")
 
-    # Prueba manual de miniatura
-    if st.session_state.sites:
-        st.divider()
-        st.subheader("🧪 Probar miniatura")
-        test_url = st.selectbox("Elegí un sitio", st.session_state.sites, key="test_url")
-        if st.button("Probar captura", use_container_width=True):
-            img, t_err = capture_thumbnail_sync(
-                test_url,
-                st.session_state.get("viewport_w", 420),
-                st.session_state.get("viewport_h", 280),
-                st.session_state.get("wait_until", "load"),
-                st.session_state.get("timeout_ms", 10000),
-                int(time.time())
-            )
-            if img:
-                st.success("¡Anduvo!")
-                st.image(img, use_container_width=True, caption="Prueba de miniatura")
-            elif t_err:
-                api_img = asyncio.run(_screenshot_via_api(test_url, st.session_state.get("viewport_w", 420)))
-                if api_img:
-                    st.info("Playwright falló; mostrando miniatura vía API (fallback).")
-                    st.image(api_img, use_container_width=True, caption="Prueba (API)")
-                else:
-                    st.error(f"Miniatura: {t_err}")
-
     st.divider()
     st.subheader("📥 Exportar histórico")
     if "history" in st.session_state and st.session_state.history:
@@ -419,178 +544,235 @@ with st.sidebar:
         st.caption("Aún no hay datos suficientes para exportar.")
 
 # ===== Header & autorefresh ===================================================
-st.title("🧭 Monitor de Sitios — Mosaico")
-st.caption("Miniaturas opcionales con métricas de tiempo y certificado SSL. Ideal para 3×3.")
+st.title("🧭 Monitor de Sitios + Journeys")
+st.caption("Miniaturas opcionales con métricas y certificado SSL. Y ahora: flujos críticos (Journeys).")
 
 _ = st_autorefresh(interval=st.session_state.get("refresh_sec", 30) * 1000, key="refresh_timer")
 
-# ===== Main ===================================================================
-if not st.session_state.sites:
-    st.info("Agregá una o más URLs desde la barra lateral para empezar 🧉")
-    st.stop()
+# ===== Tabs: Monitor / Journeys ==============================================
+tab_monitor, tab_journeys = st.tabs(["📊 Monitor", "🧪 Journeys"])
 
-urls = st.session_state.sites
-start_t = time.perf_counter()
-res = asyncio.run(run_monitor(urls))
+# ===== MONITOR ================================================================
+with tab_monitor:
+    urls = st.session_state.sites
+    if "history" not in st.session_state:
+        st.session_state.history = []
 
-# ===== Histórico en memoria (para CSV) =======================================
-if "history" not in st.session_state:
-    st.session_state.history = []
-now = int(time.time())
-for data, _ in res:
-    st.session_state.history.append({
-        "ts": now,
-        "url": data["url"],
-        "status": data.get("status"),
-        "ttfb_ms": (data.get("timings") or {}).get("ttfb_ms"),
-        "total_ms": (data.get("timings") or {}).get("total_ms"),
-        "ssl_days": data.get("ssl_days"),
-        "content_ok": data.get("content_ok")
-    })
-# cap: últimas 5000 muestras
-st.session_state.history = st.session_state.history[-5000:]
+    if not urls:
+        st.info("Agregá una o más URLs desde la barra lateral para empezar 🧉")
+    else:
+        start_t = time.perf_counter()
+        res = asyncio.run(run_monitor(urls))
 
-# ===== Alertas Teams (HTTP/slow/SSL/content) ==================================
-for data, _ in res:
-    url = data["url"]
-    status = data.get("status")
-    total = (data.get("timings") or {}).get("total_ms")
-    ssl_days = data.get("ssl_days")
-    content_ok = data.get("content_ok")
+        # ===== Histórico en memoria (para CSV) =====
+        now = int(time.time())
+        for data, _ in res:
+            st.session_state.history.append({
+                "ts": now,
+                "url": data["url"],
+                "status": data.get("status"),
+                "ttfb_ms": (data.get("timings") or {}).get("ttfb_ms"),
+                "total_ms": (data.get("timings") or {}).get("total_ms"),
+                "ssl_days": data.get("ssl_days"),
+                "content_ok": data.get("content_ok")
+            })
+        st.session_state.history = st.session_state.history[-5000:]
 
-    if status and status >= 400 and _should_alert((url, "http"), 900):
-        notify_teams(f"🔴 HTTP {status} en {url}", f"Total: {total:.0f} ms" if total else "")
-
-    if total and st.session_state.get("thr_slow", 3000) and total > st.session_state["thr_slow"]:
-        if _should_alert((url, "slow"), 900):
-            notify_teams(f"🟠 Lento {url}", f"Total {total:.0f} ms", color="#f59e0b")
-
-    if (ssl_days is not None) and (ssl_days <= st.session_state.get("thr_ssl_days", 7)):
-        if _should_alert((url, "ssl"), 21600):
-            notify_teams(f"🔴 SSL por vencer en {url}", f"{ssl_days} días")
-
-    if content_ok is False and _should_alert((url, "content"), 1800):
-        notify_teams(f"🔴 Contenido inesperado en {url}", "Reglas no se cumplen")
-
-# ===== Filtro “Mostrar solo problemas” =======================================
-show_only_bad = st.toggle("Mostrar solo problemas", value=False, help="Oculta las tarjetas sanas")
-
-cards = []
-for (data, thumb) in res:
-    is_bad = (
-        data.get("error") or
-        (data.get("status") and data["status"] >= 400) or
-        (data.get("ssl_days") is not None and data["ssl_days"] <= 14) or
-        (data.get("content_ok") is False)
-    )
-    if show_only_bad and not is_bad:
-        continue
-    cards.append((data, thumb))
-res = cards
-
-# ===== Render =================================================================
-if not res:
-    st.info("Sin tarjetas para mostrar con el filtro actual.")
-else:
-    rows = (len(res) + 2) // 3
-    idx = 0
-    for _ in range(rows):
-        cols = st.columns(3)
-        for c in cols:
-            if idx >= len(res):
-                c.empty()
-                continue
-            data, thumb = res[idx]
-            idx += 1
-
+        # ===== Alertas Teams =====
+        for data, _ in res:
             url = data["url"]
-            status = data["status"]
-            error = data["error"]
-            t = data["timings"] or {}
-            ssl_days = data["ssl_days"]
-            thumb_error = data.get("thumb_error")
+            status = data.get("status")
+            total = (data.get("timings") or {}).get("total_ms")
+            ssl_days = data.get("ssl_days")
             content_ok = data.get("content_ok")
 
-            total = t.get("total_ms") or 0
-            ttfb = t.get("ttfb_ms")
-            conn = t.get("connect_ms")
-            tls = t.get("tls_ms")
+            if status and status >= 400 and _should_alert((url, "http"), 900):
+                notify_teams(f"🔴 HTTP {status} en {url}", f"Total: {total:.0f} ms" if total else "")
 
-            if error:
-                badge = '<span class="badge err">❌ Error</span>'
-            elif status and 200 <= status < 400:
-                badge = '<span class="badge ok">✅ OK</span>'
-            elif status:
-                badge = f'<span class="badge warn">⚠️ {status}</span>'
-            else:
-                badge = '<span class="badge err">❓</span>'
+            if total and st.session_state.get("thr_slow", 3000) and total > st.session_state["thr_slow"]:
+                if _should_alert((url, "slow"), 900):
+                    notify_teams(f"🟠 Lento {url}", f"Total {total:.0f} ms", color="#f59e0b")
 
-            if total < 800:
-                perf_badge = f'<span class="badge ok">🚀 {total:.0f} ms</span>'
-            elif total < 2000:
-                perf_badge = f'<span class="badge warn">⏱️ {total:.0f} ms</span>'
-            else:
-                perf_badge = f'<span class="badge err">🐌 {total:.0f} ms</span>'
+            if (ssl_days is not None) and (ssl_days <= st.session_state.get("thr_ssl_days", 7)):
+                if _should_alert((url, "ssl"), 21600):
+                    notify_teams(f"🔴 SSL por vencer en {url}", f"{ssl_days} días")
 
-            ssl_badge = ""
-            if ssl_days is not None:
-                if ssl_days >= 30:
-                    ssl_badge = f'<span class="badge ok">🔐 SSL {ssl_days}d</span>'
-                elif ssl_days >= 7:
-                    ssl_badge = f'<span class="badge warn">🔐 SSL {ssl_days}d</span>'
-                else:
-                    ssl_badge = f'<span class="badge err">🔐 SSL {ssl_days}d</span>'
+            if content_ok is False and _should_alert((url, "content"), 1800):
+                notify_teams(f"🔴 Contenido inesperado en {url}", "Reglas no se cumplen")
 
-            content_badge = ""
-            if content_ok is not None:
-                content_badge = ('<span class="badge ok">📄 contenido OK</span>'
-                                 if content_ok else '<span class="badge err">📄 contenido ❌</span>')
+        # ===== Filtro “Mostrar solo problemas” =====
+        show_only_bad = st.toggle("Mostrar solo problemas", value=False, help="Oculta las tarjetas sanas")
 
-            # Color de tarjeta por SSL
-            card_bg = ""
-            if ssl_days is not None:
-                if ssl_days <= st.session_state.get("thr_ssl_days", 7):
-                    card_bg = "background:rgba(239,68,68,0.08);"      # rojo suave
-                elif ssl_days <= 14:
-                    card_bg = "background:rgba(245,158,11,0.08);"     # ámbar
+        cards = []
+        for (data, thumb) in res:
+            is_bad = (
+                data.get("error") or
+                (data.get("status") and data["status"] >= 400) or
+                (data.get("ssl_days") is not None and data["ssl_days"] <= 14) or
+                (data.get("content_ok") is False)
+            )
+            if show_only_bad and not is_bad:
+                continue
+            cards.append((data, thumb))
+        res = cards
 
-            with c:
-                st.markdown(f'<div class="card" style="{card_bg}">', unsafe_allow_html=True)
-                st.markdown(f"<h4>{badge} {perf_badge} {ssl_badge} {content_badge}</h4>", unsafe_allow_html=True)
-                st.markdown(f"<div class='url-line'>{url}</div>", unsafe_allow_html=True)
+        # ===== Render =====
+        if not res:
+            st.info("Sin tarjetas para mostrar con el filtro actual.")
+        else:
+            rows = (len(res) + 2) // 3
+            idx = 0
+            for _ in range(rows):
+                cols = st.columns(3)
+                for c in cols:
+                    if idx >= len(res):
+                        c.empty(); continue
+                    data, thumb = res[idx]; idx += 1
 
-                # Badge de origen PW/API sobre la imagen
-                label = "API" if (thumb_error == "miniatura vía API (fallback)") else "PW"
-                st.markdown(
-                    f"<div style='position:relative;height:0'>"
-                    f"<span style='position:absolute;top:-6px;left:8px;"
-                    f"background:#334155;color:#fff;border-radius:6px;padding:2px 6px;font-size:11px;'>{label}</span>"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
+                    url = data["url"]
+                    status = data["status"]
+                    error = data["error"]
+                    t = data["timings"] or {}
+                    ssl_days = data["ssl_days"]
+                    thumb_error = data.get("thumb_error")
+                    content_ok = data.get("content_ok")
 
-                if thumb is not None:
-                    st.image(thumb, use_container_width=True, caption="miniatura")
-                elif thumb_error:
-                    st.markdown(f"<p class='errtxt'>Miniatura: {thumb_error}</p>", unsafe_allow_html=True)
-                else:
-                    st.markdown("<div class='small'>Miniatura desactivada o no disponible.</div>", unsafe_allow_html=True)
+                    total = t.get("total_ms") or 0
+                    ttfb = t.get("ttfb_ms")
+                    conn = t.get("connect_ms")
+                    tls = t.get("tls_ms")
 
-                with st.expander("Detalles"):
                     if error:
-                        st.error(error)
-                    mc1, mc2 = st.columns(2)
-                    with mc1:
-                        st.metric("Estado", value=str(status) if status else "—")
-                        st.metric("TTFB (ms)", value=f"{ttfb:.0f}" if ttfb else "—")
-                        st.metric("Conexión (ms)", value=f"{conn:.0f}" if conn else "—")
-                    with mc2:
-                        st.metric("TLS (ms)", value=f"{tls:.0f}" if tls else "—")
-                        st.metric("Total (ms)", value=f"{total:.0f}" if total else "—")
-                        st.write(ssl_badge, unsafe_allow_html=True)
-                    st.link_button("Abrir sitio", url, use_container_width=True)
+                        badge = '<span class="badge err">❌ Error</span>'
+                    elif status and 200 <= status < 400:
+                        badge = '<span class="badge ok">✅ OK</span>'
+                    elif status:
+                        badge = f'<span class="badge warn">⚠️ {status}</span>'
+                    else:
+                        badge = '<span class="badge err">❓</span>'
 
-                st.markdown("</div>", unsafe_allow_html=True)
+                    if total < 800:
+                        perf_badge = f'<span class="badge ok">🚀 {total:.0f} ms</span>'
+                    elif total < 2000:
+                        perf_badge = f'<span class="badge warn">⏱️ {total:.0f} ms</span>'
+                    else:
+                        perf_badge = f'<span class="badge err">🐌 {total:.0f} ms</span>'
 
-end_t = time.perf_counter()
-st.caption(f"Monitoreo completado en {(end_t - start_t):.2f}s • {len(urls)} sitio(s)")
+                    ssl_badge = ""
+                    if ssl_days is not None:
+                        if ssl_days >= 30:
+                            ssl_badge = f'<span class="badge ok">🔐 SSL {ssl_days}d</span>'
+                        elif ssl_days >= 7:
+                            ssl_badge = f'<span class="badge warn">🔐 SSL {ssl_days}d</span>'
+                        else:
+                            ssl_badge = f'<span class="badge err">🔐 SSL {ssl_days}d</span>'
+
+                    content_badge = ""
+                    if content_ok is not None:
+                        content_badge = ('<span class="badge ok">📄 contenido OK</span>'
+                                         if content_ok else '<span class="badge err">📄 contenido ❌</span>')
+
+                    # Color de tarjeta por SSL
+                    card_bg = ""
+                    if ssl_days is not None:
+                        if ssl_days <= st.session_state.get("thr_ssl_days", 7):
+                            card_bg = "background:rgba(239,68,68,0.08);"      # rojo suave
+                        elif ssl_days <= 14:
+                            card_bg = "background:rgba(245,158,11,0.08);"     # ámbar
+
+                    with c:
+                        st.markdown(f'<div class="card" style="{card_bg}">', unsafe_allow_html=True)
+                        st.markdown(f"<h4>{badge} {perf_badge} {ssl_badge} {content_badge}</h4>", unsafe_allow_html=True)
+                        st.markdown(f"<div class='url-line'>{url}</div>", unsafe_allow_html=True)
+
+                        # Badge de origen PW/API sobre la imagen
+                        label = "API" if (thumb_error == "miniatura vía API (fallback)") else "PW"
+                        st.markdown(
+                            f"<div style='position:relative;height:0'>"
+                            f"<span style='position:absolute;top:-6px;left:8px;"
+                            f"background:#334155;color:#fff;border-radius:6px;padding:2px 6px;font-size:11px;'>{label}</span>"
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
+
+                        if thumb is not None:
+                            st.image(thumb, use_container_width=True, caption="miniatura")
+                        elif thumb_error:
+                            st.markdown(f"<p class='errtxt'>Miniatura: {thumb_error}</p>", unsafe_allow_html=True)
+                        else:
+                            st.markdown("<div class='small'>Miniatura desactivada o no disponible.</div>", unsafe_allow_html=True)
+
+                        with st.expander("Detalles"):
+                            if error:
+                                st.error(error)
+                            mc1, mc2 = st.columns(2)
+                            with mc1:
+                                st.metric("Estado", value=str(status) if status else "—")
+                                st.metric("TTFB (ms)", value=f"{ttfb:.0f}" if ttfb else "—")
+                                st.metric("Conexión (ms)", value=f"{conn:.0f}" if conn else "—")
+                            with mc2:
+                                st.metric("TLS (ms)", value=f"{tls:.0f}" if tls else "—")
+                                st.metric("Total (ms)", value=f"{total:.0f}" if total else "—")
+                                st.write(ssl_badge, unsafe_allow_html=True)
+                            st.link_button("Abrir sitio", url, use_container_width=True)
+
+                        st.markdown("</div>", unsafe_allow_html=True)
+
+        end_t = time.perf_counter()
+        st.caption(f"Monitoreo completado en {(end_t - start_t):.2f}s • {len(urls)} sitio(s)")
+
+# ===== JOURNEYS ===============================================================
+with tab_journeys:
+    st.subheader("Flujos críticos con Playwright")
+    st.caption("Variables: usá ${BOT_USER}, ${BOT_PASS}, etc. desde Secrets o variables de entorno.")
+
+    colj1, colj2 = st.columns([1, 1])
+    with colj1:
+        selected_journey = st.selectbox("Plantilla", ["(Elegir)", *JOURNEYS.keys()])
+    with colj2:
+        viewport_w = st.number_input("Viewport ancho", min_value=640, max_value=2560, value=1280, step=10)
+    viewport_h = st.number_input("Viewport alto", min_value=400, max_value=1600, value=800, step=10)
+    default_timeout = st.number_input("Timeout default (ms)", min_value=1000, max_value=60000, value=15000, step=500)
+
+    st.caption("Pegá pasos en JSON (opcional). Soporta: goto, wait_for, wait_network_idle, fill, press, click, expect_text, screenshot, sleep.")
+    steps_json = st.text_area(
+        "Pasos (JSON opcional)", 
+        height=220,
+        placeholder='[\n  {"op":"goto","url":"https://tu-dominio/login"},\n  {"op":"fill","selector":"input[type=email]","value":"${BOT_USER}"},\n  {"op":"fill","selector":"input[type=password]","value":"${BOT_PASS}"},\n  {"op":"click","selector":"button[type=submit]"},\n  {"op":"wait_for","selector":"#dashboard","timeout":15000},\n  {"op":"screenshot","label":"dashboard"}\n]'
+    )
+
+    steps_to_run = None
+    if steps_json.strip():
+        try:
+            steps_to_run = json.loads(steps_json)
+        except Exception as je:
+            st.error(f"JSON inválido: {je}")
+
+    if steps_to_run is None and selected_journey != "(Elegir)":
+        steps_to_run = JOURNEYS[selected_journey]
+
+    run_btn = st.button("▶️ Ejecutar Journey", use_container_width=True, type="primary")
+
+    if run_btn:
+        if not steps_to_run:
+            st.warning("Elegí una plantilla o pegá pasos en JSON.")
+        else:
+            with st.spinner("Ejecutando pasos..."):
+                result = run_journey_sync(steps_to_run, viewport=(viewport_w, viewport_h), default_timeout_ms=int(default_timeout))
+
+            if result["ok"]:
+                st.success("✅ Journey OK")
+            else:
+                st.error(f"❌ Journey falló: {result.get('error')}")
+
+            with st.expander("Ver logs"):
+                for row in result["log"]:
+                    prefix = "✅" if row["ok"] else "❌"
+                    st.write(f"{prefix} **{row['op']}** — {row['detail']}")
+
+            if result["screens"]:
+                st.subheader("Capturas")
+                for label, img in result["screens"]:
+                    st.image(img, use_container_width=True, caption=label)
+            else:
+                st.caption("Sin capturas (agregá un paso 'screenshot').")
