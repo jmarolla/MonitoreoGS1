@@ -1,8 +1,9 @@
 # app.py — Monitor de Sitios (Mosaico) para Streamlit Cloud
 # ---------------------------------------------------------
-# - Miniaturas Playwright en hilo (to_thread). Instala en ./.pw-browsers y usa executable_path.
-# - Si Playwright falla (binario ausente, permisos, etc.), cae a captura por API (mShots).
-# - HTTP/2 (fallback HTTP/1.1), SSL days, autorefresh, import/export, prueba de miniatura.
+# - Miniaturas Playwright en hilo (to_thread), instala en ./.pw-browsers y lanza con executable_path
+# - Si Playwright falla, fallback a miniatura vía API (mShots / thum.io)
+# - HTTP/2 (fallback HTTP/1.1), SSL days, autorefresh, importar/exportar, prueba manual
+# - st.image(..., use_container_width=True) (sin el parámetro deprecado)
 
 import asyncio
 import contextlib
@@ -41,10 +42,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Carpeta local para los binarios de Playwright (evita ~/.cache)
+# Carpeta local para binarios de Playwright (evita ~/.cache)
 BROWSERS_DIR = os.path.abspath("./.pw-browsers")
 os.makedirs(BROWSERS_DIR, exist_ok=True)
-
 
 # ===== Helpers ================================================================
 def normalize_url(u: str) -> str:
@@ -54,7 +54,6 @@ def normalize_url(u: str) -> str:
     if not u.startswith(("http://", "https://")):
         return "https://" + u
     return u
-
 
 def ssl_days_left(hostname: str, port: int = 443, timeout: float = 5.0) -> Optional[int]:
     try:
@@ -70,9 +69,8 @@ def ssl_days_left(hostname: str, port: int = 443, timeout: float = 5.0) -> Optio
         return None
     return None
 
-
 def _find_chrome_exec() -> Optional[str]:
-    """Busca el ejecutable de Chromium. Primero en ./.pw-browsers, luego en ~/.cache."""
+    """Busca Chromium primero en ./.pw-browsers y luego en ~/.cache."""
     roots = [
         BROWSERS_DIR,
         os.environ.get("PLAYWRIGHT_BROWSERS_PATH"),
@@ -89,32 +87,27 @@ def _find_chrome_exec() -> Optional[str]:
                     return path
     return None
 
-
 def _install_chromium(prefer_chrome: bool = True) -> Optional[str]:
-    """Instala Chromium dentro de ./.pw-browsers y devuelve la ruta del ejecutable."""
+    """Instala Chromium dentro de ./.pw-browsers y devuelve el ejecutable."""
     env = os.environ.copy()
     env["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_DIR
     env["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "0" if prefer_chrome else "1"
-
     proc = subprocess.run(
         ["python", "-m", "playwright", "install", "chromium", "--force"],
         check=False, capture_output=True, text=True, env=env
     )
     if proc.returncode != 0:
         st.caption("Miniatura: install stderr → " + (proc.stderr or "")[:250])
-
     return _find_chrome_exec()
-
 
 async def _screenshot_via_api(url: str, width: int, timeout: int = 12_000) -> Optional[bytes]:
     """
-    Fallback sin navegador: usa mShots (WordPress) para obtener una miniatura.
-    No requiere clave. Si falla, probamos un 2º endpoint (thum.io).
+    Fallback sin navegador: mShots (WordPress) y thum.io (best-effort, sin clave).
     """
     qurl = urllib.parse.quote(url, safe="")
     endpoints = [
-        f"https://s.wordpress.com/mshots/v1/{qurl}?w={width}",               # 1) mShots
-        f"https://image.thum.io/get/width/{width}/{url}",                    # 2) thum.io (sin clave, best effort)
+        f"https://s.wordpress.com/mshots/v1/{qurl}?w={width}",
+        f"https://image.thum.io/get/width/{width}/{url}",
     ]
     async with httpx.AsyncClient(timeout=timeout/1000, follow_redirects=True) as c:
         for ep in endpoints:
@@ -126,7 +119,6 @@ async def _screenshot_via_api(url: str, width: int, timeout: int = 12_000) -> Op
                 continue
     return None
 
-
 # ===== Captura Playwright (sync) ejecutada en hilo ============================
 @st.cache_data(show_spinner=False, ttl=60)
 def capture_thumbnail_sync(
@@ -135,12 +127,11 @@ def capture_thumbnail_sync(
     height: int,
     wait_until: str,
     timeout_ms: int,
-    cache_bust: int,  # participa en la clave de caché para no pegarse a un None viejo
+    cache_bust: int,  # participa en la clave de caché
 ) -> Tuple[Optional[bytes], Optional[str]]:
     """
     Devuelve (imagen_bytes, error_str).
-    - Usa Chromium en ./.pw-browsers (instala si falta)
-    - Lanza con executable_path explícito
+    - Usa Chromium en ./.pw-browsers (instala si falta) y lanza con executable_path
     - Fallback a headless_shell sólo si es lo único disponible
     """
     try:
@@ -148,7 +139,6 @@ def capture_thumbnail_sync(
     except Exception as e:
         return None, f"Playwright no disponible: {str(e)[:120]}"
 
-    # Preferimos chrome en nuestra carpeta local
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_DIR
     os.environ["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "0"
 
@@ -177,7 +167,7 @@ def capture_thumbnail_sync(
     try:
         return _launch_with(exec_path), None
     except Exception as e1:
-        # 2) Instalar chrome en ./.pw-browsers y reintentar
+        # 2) Instalar chrome y reintentar
         exec_path = _install_chromium(prefer_chrome=True) or _find_chrome_exec()
         if exec_path:
             try:
@@ -194,7 +184,6 @@ def capture_thumbnail_sync(
                 return None, f"No encontré binario tras instalar en {BROWSERS_DIR}: {str(e2)[:160]}"
         return None, f"No encontré binario tras instalar en {BROWSERS_DIR}: {str(e1)[:160]}"
 
-
 # ===== Monitoreo HTTP =========================================================
 @dataclass
 class Timings:
@@ -203,7 +192,6 @@ class Timings:
     tls_ms: Optional[float] = None
     ttfb_ms: Optional[float] = None
     total_ms: Optional[float] = None
-
 
 async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[bytes]]:
     timings = Timings()
@@ -266,9 +254,7 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
             api_img = await _screenshot_via_api(url, st.session_state.get("viewport_w", 420))
             if api_img:
                 thumb = api_img
-                # señalamos en el error que usamos API
                 thumb_err = "miniatura vía API (fallback)"
-            # si tampoco hay API, dejamos thumb en None y mostramos el error de Playwright
 
     return (
         {
@@ -282,11 +268,9 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
         thumb,
     )
 
-
 async def run_monitor(urls: List[str]) -> List[Tuple[Dict, Optional[bytes]]]:
     tasks = [monitor_once(u) for u in urls]
     return await asyncio.gather(*tasks)
-
 
 # ===== Estado inicial =========================================================
 if "sites" not in st.session_state:
@@ -295,7 +279,6 @@ if "sites" not in st.session_state:
 # Cargar desde querystring
 if not st.session_state.sites and "urls" in st.query_params:
     st.session_state.sites = [normalize_url(u) for u in st.query_params.get("urls", "").split(",") if u]
-
 
 # ===== Sidebar ================================================================
 with st.sidebar:
@@ -331,7 +314,7 @@ with st.sidebar:
     st.divider()
     st.subheader("⬆️⬇️ Importar / Exportar")
     export_txt = "\n".join(st.session_state.sites)
-    st.download_button("Exportar URLs", export_txt, file_name="sitios.txt")
+    st.download_button("Exportar URLs", export_txt, file_name="sitios.txt", use_container_width=True)
     imp = st.file_uploader("Importar .txt (una URL por línea)", type=["txt"])
     if imp is not None:
         try:
@@ -358,23 +341,20 @@ with st.sidebar:
             )
             if img:
                 st.success("¡Anduvo!")
-                st.image(img, caption="Prueba de miniatura")
+                st.image(img, use_container_width=True, caption="Prueba de miniatura")
             elif t_err:
-                # Intento API en la prueba también
                 api_img = asyncio.run(_screenshot_via_api(test_url, st.session_state.get("viewport_w", 420)))
                 if api_img:
                     st.info("Playwright falló; mostrando miniatura vía API (fallback).")
-                    st.image(api_img, caption="Prueba (API)")
+                    st.image(api_img, use_container_width=True, caption="Prueba (API)")
                 else:
                     st.error(f"Miniatura: {t_err}")
-
 
 # ===== Header & autorefresh ===================================================
 st.title("🧭 Monitor de Sitios — Mosaico")
 st.caption("Miniaturas opcionales con métricas de tiempo y certificado SSL. Ideal para 3×3.")
 
 _ = st_autorefresh(interval=st.session_state.get("refresh_sec", 30) * 1000, key="refresh_timer")
-
 
 # ===== Main ===================================================================
 if not st.session_state.sites:
@@ -440,7 +420,7 @@ for _ in range(rows):
             st.markdown(f"<div class='url-line'>{url}</div>", unsafe_allow_html=True)
 
             if thumb is not None:
-                st.image(thumb, use_column_width=True, caption="miniatura")
+                st.image(thumb, use_container_width=True, caption="miniatura")
             elif thumb_error:
                 st.markdown(f"<p class='errtxt'>Miniatura: {thumb_error}</p>", unsafe_allow_html=True)
             else:
