@@ -1,12 +1,11 @@
 # app.py — Monitor de sitios en mosaico (Streamlit)
 # -------------------------------------------------
-# Características clave:
-# - Agregá URLs y se muestran en un mosaico (3 por fila) con miniatura (screenshot),
-#   estado y métricas de tiempo.
-# - Actualización automática cada N segundos.
-# - Medición de tiempos con httpx + tracing (DNS, conexión/TLS, TTFB y total).
-# - Chequeo de certificados SSL (días restantes).
-# - Miniaturas con Playwright (opcional). Si falla, se mantiene el monitoreo sin imagen.
+# Características:
+# - Agregar URLs y ver un mosaico (3 por fila) con miniatura (opcional), estado y métricas.
+# - Refresco automático cada N segundos (streamlit-autorefresh).
+# - Medición de tiempos: TTFB (aprox) y total. (DNS/Conex/TLS se dejan en blanco por compatibilidad)
+# - Chequeo de certificado SSL (días restantes).
+# - Miniaturas con Playwright (opcional). Si falla, sigue el monitoreo sin imagen.
 # - Importar/exportar lista de sitios.
 #
 # Requisitos (requirements.txt):
@@ -15,24 +14,22 @@
 # playwright
 # cryptography
 # certifi
+# streamlit-autorefresh
 #
-# Importante para Playwright (en el build o local):
-#   python -m playwright install --with-deps chromium
-# En Streamlit Cloud, agregá un script de post-install o ejecutá el comando en el build.
+# En Streamlit Cloud: usar packages.txt y postBuild (ver README).
 
 import asyncio
-import contextlib
 import datetime as dt
 import io
 import socket
 import ssl
-import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import httpx
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 # ---- Config de página ----
 st.set_page_config(
@@ -57,25 +54,27 @@ CARD_CSS = """
 .small{font-size:0.8rem; opacity:0.85}
 </style>
 """
-
 st.markdown(CARD_CSS, unsafe_allow_html=True)
 
 # ---- Estado ----
 if "sites" not in st.session_state:
     st.session_state.sites: List[str] = []
 
-# Persistencia simple en query params
-q = st.experimental_get_query_params()
-if not st.session_state.sites and "urls" in q:
-    st.session_state.sites = [u for u in q.get("urls", [""])[0].split(",") if u]
+# Cargar desde querystring (nuevo API: st.query_params)
+if not st.session_state.sites and "urls" in st.query_params:
+    st.session_state.sites = [u for u in st.query_params.get("urls", "").split(",") if u]
 
 # ---- Sidebar: control ----
 with st.sidebar:
     st.header("⚙️ Controles")
     refresh_sec = st.number_input("Refrescar cada (seg)", min_value=5, max_value=300, value=30, step=5)
     thumb_on = st.toggle("Miniaturas (Playwright)", value=False, help="Activalo para ver capturas.")
-    wait_until = st.selectbox("Estrategia de carga", ["load", "domcontentloaded", "networkidle"], index=0,
-                              help="Cómo espera Playwright antes de capturar.")
+    wait_until = st.selectbox(
+        "Estrategia de carga",
+        ["load", "domcontentloaded", "networkidle"],
+        index=0,
+        help="Cómo espera Playwright antes de capturar."
+    )
     viewport_w = st.number_input("Ancho miniatura", 200, 1024, 420, 10)
     viewport_h = st.number_input("Alto miniatura", 150, 1024, 280, 10)
     timeout_ms = int(st.number_input("Timeout (ms)", 1000, 60000, 10000, 500))
@@ -83,16 +82,17 @@ with st.sidebar:
     st.divider()
     st.subheader("➕ Agregar sitio")
     new_url = st.text_input("URL", placeholder="https://tu-sitio.com")
-    col_add1, col_add2 = st.columns([1,1])
+    col_add1, col_add2 = st.columns([1, 1])
     with col_add1:
         if st.button("Agregar", use_container_width=True) and new_url:
             if new_url not in st.session_state.sites:
                 st.session_state.sites.append(new_url)
-                st.experimental_set_query_params(urls=",".join(st.session_state.sites))
+                st.query_params["urls"] = ",".join(st.session_state.sites)
     with col_add2:
         if st.button("Limpiar lista", use_container_width=True):
             st.session_state.sites = []
-            st.experimental_set_query_params()
+            # limpiar querystring
+            st.query_params.clear()
 
     st.caption("Tip: podés compartir la app con ?urls=... para precargar.")
 
@@ -105,93 +105,16 @@ with st.sidebar:
         try:
             data = imp.read().decode("utf-8", errors="ignore").splitlines()
             st.session_state.sites = [d.strip() for d in data if d.strip()]
-            st.experimental_set_query_params(urls=",".join(st.session_state.sites))
+            st.query_params["urls"] = ",".join(st.session_state.sites)
             st.success(f"Importadas {len(st.session_state.sites)} URLs")
         except Exception as e:
             st.error(f"Error importando: {e}")
 
-# ---- Auto refresh ----
-st_autorefresh = st.experimental_memo(lambda x: None)  # placeholder para evitar warning si no se usa
-st_autorefresh = st.experimental_rerun  # alias mental, no se usa directamente
-st.experimental_set_query_params(urls=",".join(st.session_state.sites))
-st_autorefresh_token = st.experimental_data_editor if False else None  # nada, solo para acordarse ;-)
-st.autorefresh = st.experimental_singleton(lambda: None)  # no-op, para estilo
-st.runtime.legacy_caching.clear_cache  # satisfy linter
-
 st.title("🧭 Monitor de Sitios — Mosaico")
 st.caption("Miniaturas opcionales con métricas de tiempo y certificado SSL. Ideal para 3×3.")
 
-# Refresco automático
-st.experimental_set_query_params(urls=",".join(st.session_state.sites))
-st.runtime.scriptrunner.add_script_run_ctx  # noop para calmar linters
-st.session_state.setdefault("_tick", 0)
-
-# Usamos st_autorefresh real
-st.experimental_memo.clear()
-st.experimental_singleton.clear()
-st_autorefresh_id = st.autorefresh if False else None
-st_autorefresh_res = st.experimental_rerun if False else None
-st_autorefresh_widget = st.experimental_get_query_params  # placeholder
-st_autorefresh_value = st.experimental_get_query_params  # placeholder
-st_autorefresh_counter = st.experimental_get_query_params  # placeholder
-st_autorefresh_dummy = None
-st_autorefresh_component = st.experimental_get_query_params  # placeholder
-
-# Streamlit tiene st_autorefresh, usémoslo de verdad:
-st_autorefresh_count = st.experimental_data_editor if False else None
-count = st.autorefresh if False else None
-
-from streamlit_autorefresh import st_autorefresh as _real_autorefresh  # type: ignore
-try:
-    _ = _real_autorefresh(interval=refresh_sec*1000, key="refresh")
-except Exception:
-    pass
-
-# ---- Tracing HTTPX ----
-@dataclass
-class Timings:
-    dns_ms: Optional[float] = None
-    connect_ms: Optional[float] = None
-    tls_ms: Optional[float] = None
-    ttfb_ms: Optional[float] = None
-    total_ms: Optional[float] = None
-
-class Trace:
-    def __init__(self):
-        self.start = time.perf_counter()
-        self.dns_start = self.conn_start = self.tls_start = self.req_start = None
-        self.timings = Timings()
-
-    async def on_dns_resolve(self, *args, **kwargs):
-        if self.dns_start is None:
-            self.dns_start = time.perf_counter()
-        else:
-            self.timings.dns_ms = (time.perf_counter() - self.dns_start) * 1000
-
-    async def on_connection_open(self, *args, **kwargs):
-        self.conn_start = time.perf_counter()
-
-    async def on_connection_opened(self, *args, **kwargs):
-        if self.conn_start:
-            self.timings.connect_ms = (time.perf_counter() - self.conn_start) * 1000
-
-    async def on_tls_handshake(self, *args, **kwargs):
-        self.tls_start = time.perf_counter()
-
-    async def on_tls_handshake_completed(self, *args, **kwargs):
-        if self.tls_start:
-            self.timings.tls_ms = (time.perf_counter() - self.tls_start) * 1000
-
-    async def on_request_headers_sent(self, *args, **kwargs):
-        self.req_start = time.perf_counter()
-
-    async def on_response_headers_received(self, *args, **kwargs):
-        if self.req_start:
-            self.timings.ttfb_ms = (time.perf_counter() - self.req_start) * 1000
-
-    def finish(self):
-        self.timings.total_ms = (time.perf_counter() - self.start) * 1000
-        return self.timings
+# ---- Refresco automático (sin experimental) ----
+_ = st_autorefresh(interval=refresh_sec * 1000, key="refresh_timer")
 
 # ---- SSL expiry ----
 def ssl_days_left(hostname: str, port: int = 443, timeout: float = 5.0) -> Optional[int]:
@@ -200,7 +123,7 @@ def ssl_days_left(hostname: str, port: int = 443, timeout: float = 5.0) -> Optio
         with socket.create_connection((hostname, port), timeout=timeout) as sock:
             with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
                 cert = ssock.getpeercert()
-        not_after = cert.get('notAfter')
+        not_after = cert.get("notAfter")
         if not_after:
             exp = dt.datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
             days = (exp - dt.datetime.utcnow()).days
@@ -229,31 +152,41 @@ def capture_thumbnail(url: str, width: int, height: int, wait_until: str, timeou
     except Exception:
         return None
 
-# ---- Monitor ----
+# ---- Medición de tiempos con httpx ----
+@dataclass
+class Timings:
+    dns_ms: Optional[float] = None
+    connect_ms: Optional[float] = None
+    tls_ms: Optional[float] = None
+    ttfb_ms: Optional[float] = None
+    total_ms: Optional[float] = None
+
 async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[bytes]]:
-    trace = Trace()
-    transport = httpx.AsyncHTTPTransport(retries=0)
+    timings = Timings()
+    status = None
+    error = None
+
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=20)
-    async with httpx.AsyncClient(http2=True, transport=transport, limits=limits, timeout=timeout, event_hooks={
-        "dns_resolve": [trace.on_dns_resolve],
-        "connection_open": [trace.on_connection_open],
-        "connection_opened": [trace.on_connection_opened],
-        "tls_handshake": [trace.on_tls_handshake],
-        "tls_handshake_completed": [trace.on_tls_handshake_completed],
-        "request_headers": [trace.on_request_headers_sent],
-        "response_headers": [trace.on_response_headers_received],
-    }) as client:
-        error = None
-        status = None
-        started = time.perf_counter()
+    async with httpx.AsyncClient(http2=True, limits=limits, timeout=timeout) as client:
+        start = time.perf_counter()
         try:
-            r = await client.get(url, follow_redirects=True)
-            status = r.status_code
+            # Medimos TTFB aproximado usando streaming y leyendo el primer chunk
+            async with client.stream("GET", url, follow_redirects=True) as r:
+                status = r.status_code
+                try:
+                    async for _chunk in r.aiter_raw():
+                        timings.ttfb_ms = (time.perf_counter() - start) * 1000.0
+                        break
+                except Exception:
+                    # si no hay cuerpo, al menos tenemos headers
+                    timings.ttfb_ms = (time.perf_counter() - start) * 1000.0
+                # Leemos el resto (descartado) para cerrar prolijo
+                with contextlib.suppress(Exception):
+                    await r.aread()
         except Exception as e:
             error = str(e)
         finally:
-            timings = trace.finish()
-            timings.total_ms = (time.perf_counter() - started) * 1000
+            timings.total_ms = (time.perf_counter() - start) * 1000.0
 
     # SSL days
     host = None
@@ -268,15 +201,17 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
     if thumb_on:
         thumb = capture_thumbnail(url, viewport_w, viewport_h, wait_until, timeout_ms)
 
-    return {
-        "url": url,
-        "status": status,
-        "error": error,
-        "timings": timings.__dict__,
-        "ssl_days": days_ssl,
-    }, thumb
+    return (
+        {
+            "url": url,
+            "status": status,
+            "error": error,
+            "timings": timings.__dict__,
+            "ssl_days": days_ssl,
+        },
+        thumb,
+    )
 
-# ---- Ejecutar monitoreo en paralelo ----
 async def run_monitor(urls: List[str]) -> List[Tuple[Dict, Optional[bytes]]]:
     tasks = [monitor_once(u) for u in urls]
     return await asyncio.gather(*tasks)
@@ -309,8 +244,8 @@ for _ in range(rows):
 
         total = t.get("total_ms") or 0
         ttfb = t.get("ttfb_ms")
-        conn = t.get("connect_ms")
-        tls = t.get("tls_ms")
+        conn = t.get("connect_ms")  # sin instrumentación, queda como None
+        tls = t.get("tls_ms")       # sin instrumentación, queda como None
 
         # Badges
         if error:
@@ -363,7 +298,7 @@ for _ in range(rows):
                     st.write(ssl_badge, unsafe_allow_html=True)
                 st.link_button("Abrir sitio", url, use_container_width=True)
 
-            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
 
 end_t = time.perf_counter()
-st.caption(f"Monitoreo completado en { (end_t-start_t):.2f}s • {len(urls)} sitio(s)")
+st.caption(f"Monitoreo completado en {(end_t - start_t):.2f}s • {len(urls)} sitio(s)")
