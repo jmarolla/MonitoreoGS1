@@ -3,7 +3,8 @@
 # - Miniaturas Playwright en hilo (to_thread), instala en ./.pw-browsers y lanza con executable_path
 # - Si Playwright falla, fallback a miniatura vía API (mShots / thum.io)
 # - HTTP/2 (fallback HTTP/1.1), SSL days, autorefresh, importar/exportar, prueba manual
-# - st.image(..., use_container_width=True) (sin el parámetro deprecado)
+# - Mejoras: badge PW/API, filtro “solo problemas”, color por SSL, reglas de contenido,
+#            histórico en memoria + CSV, alertas a Microsoft Teams con cooldown
 
 import asyncio
 import contextlib
@@ -17,6 +18,8 @@ import os
 import glob
 import subprocess
 import urllib.parse
+import csv
+import io
 
 import httpx
 import streamlit as st
@@ -234,6 +237,23 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
         pass
     days_ssl = ssl_days_left(host) if host else None
 
+    # Reglas de contenido (globales)
+    content_ok = None
+    if st.session_state.get("rule_must") or st.session_state.get("rule_must_not"):
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as cc:
+                rr = await cc.get(url)
+                body = (rr.text or "").lower()
+                must = (st.session_state.get("rule_must") or "").lower().strip()
+                must_not = (st.session_state.get("rule_must_not") or "").lower().strip()
+                content_ok = True
+                if must and (must not in body):
+                    content_ok = False
+                if must_not and (must_not in body):
+                    content_ok = False
+        except Exception:
+            content_ok = False
+
     # Miniatura: Playwright → si falla, API
     if st.session_state.get("thumb_on"):
         # 1) Intento Playwright en hilo
@@ -264,6 +284,7 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
             "timings": timings.__dict__,
             "ssl_days": days_ssl,
             "thumb_error": thumb_err,
+            "content_ok": content_ok,
         },
         thumb,
     )
@@ -271,6 +292,31 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
 async def run_monitor(urls: List[str]) -> List[Tuple[Dict, Optional[bytes]]]:
     tasks = [monitor_once(u) for u in urls]
     return await asyncio.gather(*tasks)
+
+# ===== Alertas a Microsoft Teams =============================================
+def notify_teams(title: str, text: str, color="#d83b01"):
+    url = st.secrets.get("TEAMS_WEBHOOK")
+    if not url:
+        return
+    payload = {
+        "@type": "MessageCard", "@context": "http://schema.org/extensions",
+        "summary": title, "themeColor": color,
+        "sections": [{"activityTitle": title, "text": text}],
+    }
+    try:
+        httpx.post(url, json=payload, timeout=10)
+    except Exception:
+        pass
+
+if "alert_cooldown" not in st.session_state:
+    st.session_state.alert_cooldown = {}  # clave: (url, tipo) -> ts
+
+def _should_alert(key: tuple, cooldown_sec=900):
+    last = st.session_state.alert_cooldown.get(key, 0)
+    if time.time() - last >= cooldown_sec:
+        st.session_state.alert_cooldown[key] = time.time()
+        return True
+    return False
 
 # ===== Estado inicial =========================================================
 if "sites" not in st.session_state:
@@ -293,6 +339,16 @@ with st.sidebar:
     st.session_state["viewport_w"] = st.number_input("Ancho miniatura", 200, 1024, 420, 10)
     st.session_state["viewport_h"] = st.number_input("Alto miniatura", 150, 1024, 280, 10)
     st.session_state["timeout_ms"] = int(st.number_input("Timeout (ms)", 1000, 60000, 10000, 500))
+
+    st.divider()
+    st.subheader("🔎 Reglas de contenido (global)")
+    st.text_input("Debe contener (texto)", key="rule_must")
+    st.text_input("No debe contener (texto)", key="rule_must_not")
+
+    st.divider()
+    st.subheader("🔔 Umbrales de alerta")
+    st.number_input("Umbral de lento (ms)", min_value=0, max_value=60000, value=3000, step=500, key="thr_slow")
+    st.number_input("Alerta SSL si ≤ (días)", min_value=1, max_value=60, value=7, step=1, key="thr_ssl_days")
 
     st.divider()
     st.subheader("➕ Agregar sitio")
@@ -350,6 +406,18 @@ with st.sidebar:
                 else:
                     st.error(f"Miniatura: {t_err}")
 
+    st.divider()
+    st.subheader("📥 Exportar histórico")
+    if "history" in st.session_state and st.session_state.history:
+        fp = io.StringIO()
+        writer = csv.DictWriter(fp, fieldnames=["ts","url","status","ttfb_ms","total_ms","ssl_days","content_ok"])
+        writer.writeheader()
+        writer.writerows(st.session_state.history)
+        st.download_button("Descargar CSV", fp.getvalue().encode("utf-8"),
+                           file_name="monitor_history.csv", mime="text/csv", use_container_width=True)
+    else:
+        st.caption("Aún no hay datos suficientes para exportar.")
+
 # ===== Header & autorefresh ===================================================
 st.title("🧭 Monitor de Sitios — Mosaico")
 st.caption("Miniaturas opcionales con métricas de tiempo y certificado SSL. Ideal para 3×3.")
@@ -365,80 +433,164 @@ urls = st.session_state.sites
 start_t = time.perf_counter()
 res = asyncio.run(run_monitor(urls))
 
-# Render 3 por fila
-rows = (len(urls) + 2) // 3
-idx = 0
-for _ in range(rows):
-    cols = st.columns(3)
-    for c in cols:
-        if idx >= len(res):
-            c.empty()
-            continue
-        data, thumb = res[idx]
-        idx += 1
+# ===== Histórico en memoria (para CSV) =======================================
+if "history" not in st.session_state:
+    st.session_state.history = []
+now = int(time.time())
+for data, _ in res:
+    st.session_state.history.append({
+        "ts": now,
+        "url": data["url"],
+        "status": data.get("status"),
+        "ttfb_ms": (data.get("timings") or {}).get("ttfb_ms"),
+        "total_ms": (data.get("timings") or {}).get("total_ms"),
+        "ssl_days": data.get("ssl_days"),
+        "content_ok": data.get("content_ok")
+    })
+# cap: últimas 5000 muestras
+st.session_state.history = st.session_state.history[-5000:]
 
-        url = data["url"]
-        status = data["status"]
-        error = data["error"]
-        t = data["timings"] or {}
-        ssl_days = data["ssl_days"]
-        thumb_error = data.get("thumb_error")
+# ===== Alertas Teams (HTTP/slow/SSL/content) ==================================
+for data, _ in res:
+    url = data["url"]
+    status = data.get("status")
+    total = (data.get("timings") or {}).get("total_ms")
+    ssl_days = data.get("ssl_days")
+    content_ok = data.get("content_ok")
 
-        total = t.get("total_ms") or 0
-        ttfb = t.get("ttfb_ms")
-        conn = t.get("connect_ms")
-        tls = t.get("tls_ms")
+    if status and status >= 400 and _should_alert((url, "http"), 900):
+        notify_teams(f"🔴 HTTP {status} en {url}", f"Total: {total:.0f} ms" if total else "")
 
-        if error:
-            badge = '<span class="badge err">❌ Error</span>'
-        elif status and 200 <= status < 400:
-            badge = '<span class="badge ok">✅ OK</span>'
-        elif status:
-            badge = f'<span class="badge warn">⚠️ {status}</span>'
-        else:
-            badge = '<span class="badge err">❓</span>'
+    if total and st.session_state.get("thr_slow", 3000) and total > st.session_state["thr_slow"]:
+        if _should_alert((url, "slow"), 900):
+            notify_teams(f"🟠 Lento {url}", f"Total {total:.0f} ms", color="#f59e0b")
 
-        if total < 800:
-            perf_badge = f'<span class="badge ok">🚀 {total:.0f} ms</span>'
-        elif total < 2000:
-            perf_badge = f'<span class="badge warn">⏱️ {total:.0f} ms</span>'
-        else:
-            perf_badge = f'<span class="badge err">🐌 {total:.0f} ms</span>'
+    if (ssl_days is not None) and (ssl_days <= st.session_state.get("thr_ssl_days", 7)):
+        if _should_alert((url, "ssl"), 21600):
+            notify_teams(f"🔴 SSL por vencer en {url}", f"{ssl_days} días")
 
-        ssl_badge = ""
-        if ssl_days is not None:
-            if ssl_days >= 30:
-                ssl_badge = f'<span class="badge ok">🔐 SSL {ssl_days}d</span>'
-            elif ssl_days >= 7:
-                ssl_badge = f'<span class="badge warn">🔐 SSL {ssl_days}d</span>'
+    if content_ok is False and _should_alert((url, "content"), 1800):
+        notify_teams(f"🔴 Contenido inesperado en {url}", "Reglas no se cumplen")
+
+# ===== Filtro “Mostrar solo problemas” =======================================
+show_only_bad = st.toggle("Mostrar solo problemas", value=False, help="Oculta las tarjetas sanas")
+
+cards = []
+for (data, thumb) in res:
+    is_bad = (
+        data.get("error") or
+        (data.get("status") and data["status"] >= 400) or
+        (data.get("ssl_days") is not None and data["ssl_days"] <= 14) or
+        (data.get("content_ok") is False)
+    )
+    if show_only_bad and not is_bad:
+        continue
+    cards.append((data, thumb))
+res = cards
+
+# ===== Render =================================================================
+if not res:
+    st.info("Sin tarjetas para mostrar con el filtro actual.")
+else:
+    rows = (len(res) + 2) // 3
+    idx = 0
+    for _ in range(rows):
+        cols = st.columns(3)
+        for c in cols:
+            if idx >= len(res):
+                c.empty()
+                continue
+            data, thumb = res[idx]
+            idx += 1
+
+            url = data["url"]
+            status = data["status"]
+            error = data["error"]
+            t = data["timings"] or {}
+            ssl_days = data["ssl_days"]
+            thumb_error = data.get("thumb_error")
+            content_ok = data.get("content_ok")
+
+            total = t.get("total_ms") or 0
+            ttfb = t.get("ttfb_ms")
+            conn = t.get("connect_ms")
+            tls = t.get("tls_ms")
+
+            if error:
+                badge = '<span class="badge err">❌ Error</span>'
+            elif status and 200 <= status < 400:
+                badge = '<span class="badge ok">✅ OK</span>'
+            elif status:
+                badge = f'<span class="badge warn">⚠️ {status}</span>'
             else:
-                ssl_badge = f'<span class="badge err">🔐 SSL {ssl_days}d</span>'
+                badge = '<span class="badge err">❓</span>'
 
-        with c:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown(f"<h4>{badge} {perf_badge} {ssl_badge}</h4>", unsafe_allow_html=True)
-            st.markdown(f"<div class='url-line'>{url}</div>", unsafe_allow_html=True)
-
-            if thumb is not None:
-                st.image(thumb, use_container_width=True, caption="miniatura")
-            elif thumb_error:
-                st.markdown(f"<p class='errtxt'>Miniatura: {thumb_error}</p>", unsafe_allow_html=True)
+            if total < 800:
+                perf_badge = f'<span class="badge ok">🚀 {total:.0f} ms</span>'
+            elif total < 2000:
+                perf_badge = f'<span class="badge warn">⏱️ {total:.0f} ms</span>'
             else:
-                st.markdown("<div class='small'>Miniatura desactivada o no disponible.</div>", unsafe_allow_html=True)
+                perf_badge = f'<span class="badge err">🐌 {total:.0f} ms</span>'
 
-            with st.expander("Detalles"):
-                if error:
-                    st.error(error)
-                mc1, mc2 = st.columns(2)
-                with mc1:
-                    st.metric("Estado", value=str(status) if status else "—")
-                    st.metric("TTFB (ms)", value=f"{ttfb:.0f}" if ttfb else "—")
-                    st.metric("Conexión (ms)", value=f"{conn:.0f}" if conn else "—")
-                with mc2:
-                    st.metric("TLS (ms)", value=f"{tls:.0f}" if tls else "—")
-                    st.metric("Total (ms)", value=f"{total:.0f}" if total else "—")
-                    st.write(ssl_badge, unsafe_allow_html=True)
-                st.link_button("Abrir sitio", url, use_container_width=True)
+            ssl_badge = ""
+            if ssl_days is not None:
+                if ssl_days >= 30:
+                    ssl_badge = f'<span class="badge ok">🔐 SSL {ssl_days}d</span>'
+                elif ssl_days >= 7:
+                    ssl_badge = f'<span class="badge warn">🔐 SSL {ssl_days}d</span>'
+                else:
+                    ssl_badge = f'<span class="badge err">🔐 SSL {ssl_days}d</span>'
+
+            content_badge = ""
+            if content_ok is not None:
+                content_badge = ('<span class="badge ok">📄 contenido OK</span>'
+                                 if content_ok else '<span class="badge err">📄 contenido ❌</span>')
+
+            # Color de tarjeta por SSL
+            card_bg = ""
+            if ssl_days is not None:
+                if ssl_days <= st.session_state.get("thr_ssl_days", 7):
+                    card_bg = "background:rgba(239,68,68,0.08);"      # rojo suave
+                elif ssl_days <= 14:
+                    card_bg = "background:rgba(245,158,11,0.08);"     # ámbar
+
+            with c:
+                st.markdown(f'<div class="card" style="{card_bg}">', unsafe_allow_html=True)
+                st.markdown(f"<h4>{badge} {perf_badge} {ssl_badge} {content_badge}</h4>", unsafe_allow_html=True)
+                st.markdown(f"<div class='url-line'>{url}</div>", unsafe_allow_html=True)
+
+                # Badge de origen PW/API sobre la imagen
+                label = "API" if (thumb_error == "miniatura vía API (fallback)") else "PW"
+                st.markdown(
+                    f"<div style='position:relative;height:0'>"
+                    f"<span style='position:absolute;top:-6px;left:8px;"
+                    f"background:#334155;color:#fff;border-radius:6px;padding:2px 6px;font-size:11px;'>{label}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+                if thumb is not None:
+                    st.image(thumb, use_container_width=True, caption="miniatura")
+                elif thumb_error:
+                    st.markdown(f"<p class='errtxt'>Miniatura: {thumb_error}</p>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<div class='small'>Miniatura desactivada o no disponible.</div>", unsafe_allow_html=True)
+
+                with st.expander("Detalles"):
+                    if error:
+                        st.error(error)
+                    mc1, mc2 = st.columns(2)
+                    with mc1:
+                        st.metric("Estado", value=str(status) if status else "—")
+                        st.metric("TTFB (ms)", value=f"{ttfb:.0f}" if ttfb else "—")
+                        st.metric("Conexión (ms)", value=f"{conn:.0f}" if conn else "—")
+                    with mc2:
+                        st.metric("TLS (ms)", value=f"{tls:.0f}" if tls else "—")
+                        st.metric("Total (ms)", value=f"{total:.0f}" if total else "—")
+                        st.write(ssl_badge, unsafe_allow_html=True)
+                    st.link_button("Abrir sitio", url, use_container_width=True)
+
+                st.markdown("</div>", unsafe_allow_html=True)
 
 end_t = time.perf_counter()
 st.caption(f"Monitoreo completado en {(end_t - start_t):.2f}s • {len(urls)} sitio(s)")
