@@ -1,12 +1,9 @@
-# app.py — Monitor de sitios en mosaico (Streamlit)
-# -------------------------------------------------
+# app.py — Monitor de Sitios (Mosaico) para Streamlit Cloud
+# ---------------------------------------------------------
 # - Mosaico 3x3 con miniaturas (Playwright opcional), estado HTTP y métricas.
-# - Refresco automático con streamlit-autorefresh.
-# - HTTP/2 habilitado (httpx[http2] + h2 + hpack + hyperframe) con fallback a HTTP/1.1.
-# - Normaliza URLs sin esquema (agrega https://).
-# - Chequeo de SSL (días restantes).
-# - Importar/exportar lista de sitios.
-# - Captura Playwright ejecutada en HILO (to_thread) para evitar conflictos con asyncio.
+# - HTTP/2 via httpx[http2] con fallback a HTTP/1.1.
+# - Captura Playwright en hilo (to_thread) + auto-install si falta Chromium.
+# - URLs normalizadas, SSL days, autorefresh, import/export y prueba de miniatura.
 
 import asyncio
 import contextlib
@@ -16,15 +13,15 @@ import ssl
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+import subprocess
 
 import httpx
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-# ---- Config de página ----
+# ---------- Config ----------
 st.set_page_config(page_title="Monitor de Sitios (Mosaico)", page_icon="🧭", layout="wide")
 
-# ---- Estilos ----
 st.markdown(
     """
 <style>
@@ -42,7 +39,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---- Helpers ----
+# ---------- Helpers ----------
 def normalize_url(u: str) -> str:
     u = (u or "").strip()
     if not u:
@@ -65,18 +62,27 @@ def ssl_days_left(hostname: str, port: int = 443, timeout: float = 5.0) -> Optio
         return None
     return None
 
-# ---- Captura de miniatura (SINCRÓNICA) ejecutada en hilo ----
+# ---------- Captura Playwright (sync) ejecutada en hilo ----------
 @st.cache_data(show_spinner=False, ttl=60)
-def capture_thumbnail_sync(url: str, width: int, height: int, wait_until: str, timeout_ms: int, cache_bust: int) -> Tuple[Optional[bytes], Optional[str]]:
+def capture_thumbnail_sync(
+    url: str,
+    width: int,
+    height: int,
+    wait_until: str,
+    timeout_ms: int,
+    cache_bust: int,
+) -> Tuple[Optional[bytes], Optional[str]]:
     """
-    Devuelve (imagen_bytes, error_str). Se ejecuta en un hilo con asyncio.to_thread().
-    cache_bust participa de la clave de caché para evitar que quede pegado un None viejo.
+    Devuelve (imagen_bytes, error_str). Instala Chromium si falta y reintenta una vez.
+    'cache_bust' participa de la clave de caché (evita pegarse a un None viejo).
     """
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:
         return None, f"Playwright no disponible: {str(e)[:100]}"
-    try:
+
+    def _launch_and_shoot():
+        from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
@@ -90,10 +96,27 @@ def capture_thumbnail_sync(url: str, width: int, height: int, wait_until: str, t
             page.goto(url, wait_until=wait_until, timeout=timeout_ms)
             img = page.screenshot(full_page=False)
             context.close(); browser.close()
-            return img, None
+            return img
+
+    # Primer intento
+    try:
+        return _launch_and_shoot(), None
     except Exception as e:
-        # Ejemplos: "It looks like you are using Playwright Sync API inside the asyncio loop..."
-        return None, str(e)[:200]
+        msg = str(e)
+        # Si falta el ejecutable, intentamos instalar Chromium y reintentamos
+        if "Executable doesn't exist" in msg or "No usable browsers" in msg or "executable" in msg.lower():
+            try:
+                subprocess.run(
+                    ["python", "-m", "playwright", "install", "chromium", "--force"],
+                    check=False, capture_output=True, text=True
+                )
+                try:
+                    return _launch_and_shoot(), None
+                except Exception as e2:
+                    return None, f"Instalado, pero falló al lanzar: {str(e2)[:200]}"
+            except Exception as ie:
+                return None, f"No pude instalar Chromium: {str(ie)[:200]}"
+        return None, msg[:200]
 
 @dataclass
 class Timings:
@@ -103,6 +126,7 @@ class Timings:
     ttfb_ms: Optional[float] = None
     total_ms: Optional[float] = None
 
+# ---------- Monitoreo ----------
 async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[bytes]]:
     timings = Timings()
     status = None
@@ -145,7 +169,7 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
         pass
     days_ssl = ssl_days_left(host) if host else None
 
-    # Thumbnail en hilo (evita "Sync API en asyncio loop")
+    # Miniatura en hilo (evita "Sync API dentro del bucle asyncio")
     if st.session_state.get("thumb_on"):
         img, t_err = await asyncio.to_thread(
             capture_thumbnail_sync,
@@ -174,15 +198,15 @@ async def run_monitor(urls: List[str]) -> List[Tuple[Dict, Optional[bytes]]]:
     tasks = [monitor_once(u) for u in urls]
     return await asyncio.gather(*tasks)
 
-# ---- Estado inicial ----
+# ---------- Estado ----------
 if "sites" not in st.session_state:
     st.session_state.sites: List[str] = []
 
-# Cargar de querystring
+# Cargar desde querystring
 if not st.session_state.sites and "urls" in st.query_params:
     st.session_state.sites = [normalize_url(u) for u in st.query_params.get("urls", "").split(",") if u]
 
-# ---- Sidebar ----
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("⚙️ Controles")
     refresh_sec = st.number_input("Refrescar cada (seg)", min_value=5, max_value=300, value=30, step=5)
@@ -247,14 +271,14 @@ with st.sidebar:
             elif t_err:
                 st.error(f"Miniatura: {t_err}")
 
-# ---- Header ----
+# ---------- Header ----------
 st.title("🧭 Monitor de Sitios — Mosaico")
 st.caption("Miniaturas opcionales con métricas de tiempo y certificado SSL. Ideal para 3×3.")
 
-# ---- Autorefresh ----
+# ---------- Autorefresh ----------
 _ = st_autorefresh(interval=st.session_state.get("refresh_sec", 30) * 1000, key="refresh_timer")
 
-# ---- Main ----
+# ---------- Main ----------
 if not st.session_state.sites:
     st.info("Agregá una o más URLs desde la barra lateral para empezar 🧉")
     st.stop()
@@ -263,7 +287,7 @@ urls = st.session_state.sites
 start_t = time.perf_counter()
 res = asyncio.run(run_monitor(urls))
 
-# ---- Render (3 por fila) ----
+# Render 3 por fila
 rows = (len(urls) + 2) // 3
 idx = 0
 for _ in range(rows):
@@ -337,8 +361,6 @@ for _ in range(rows):
                     st.metric("Total (ms)", value=f"{total:.0f}" if total else "—")
                     st.write(ssl_badge, unsafe_allow_html=True)
                 st.link_button("Abrir sitio", url, use_container_width=True)
-
-            st.markdown("</div>", unsafe_allow_html=True)
 
 end_t = time.perf_counter()
 st.caption(f"Monitoreo completado en {(end_t - start_t):.2f}s • {len(urls)} sitio(s)")
