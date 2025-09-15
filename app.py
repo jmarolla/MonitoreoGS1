@@ -1,9 +1,8 @@
 # app.py — Monitor de Sitios (Mosaico) para Streamlit Cloud
 # ---------------------------------------------------------
-# - Mosaico 3x3 con miniaturas (Playwright opcional), estado HTTP y métricas.
-# - HTTP/2 via httpx[http2] con fallback a HTTP/1.1.
-# - Captura Playwright en hilo (to_thread) + auto-fix de binario (chromium/headless_shell).
-# - URLs normalizadas, SSL days, autorefresh, import/export y prueba de miniatura.
+# - Miniaturas Playwright en hilo (sin bloquear asyncio)
+# - Fuerza usar chromium "chrome" (no headless_shell) y reinstala si falta
+# - HTTP/2 (fallback a HTTP/1.1), SSL days, autorefresh, import/export, prueba de miniatura
 
 import asyncio
 import contextlib
@@ -64,16 +63,16 @@ def ssl_days_left(hostname: str, port: int = 443, timeout: float = 5.0) -> Optio
         return None
     return None
 
-def _find_any_chromium_path() -> Optional[str]:
-    """Busca chrome/headless_shell en los lugares típicos."""
+# Preferimos el binario "chrome" (no headless_shell)
+def _find_chrome_exec() -> Optional[str]:
     roots = [
         os.environ.get("PLAYWRIGHT_BROWSERS_PATH"),
         os.path.expanduser("~/.cache/ms-playwright"),
     ]
-    patterns = [
-        "chromium-*/chrome-linux/chrome",
-        "chromium_headless_shell-*/chrome-linux/headless_shell",
-    ]
+    # 1) chromium "normal"
+    patterns = ["chromium-*/chrome-linux/chrome"]
+    # 2) como último recurso, headless_shell
+    patterns += ["chromium_headless_shell-*/chrome-linux/headless_shell"]
     for root in [r for r in roots if r]:
         for pat in patterns:
             for path in glob.glob(os.path.join(root, pat)):
@@ -81,18 +80,16 @@ def _find_any_chromium_path() -> Optional[str]:
                     return path
     return None
 
-def _ensure_chromium_installed(force_normal_chromium: bool = False) -> Optional[str]:
-    """Instala el navegador si falta y devuelve la ruta al ejecutable."""
+def _install_chromium(prefer_chrome=True) -> Optional[str]:
     env = os.environ.copy()
-    if force_normal_chromium:
-        # Forzamos a NO usar headless_shell
+    # Forzamos a NO usar headless_shell
+    if prefer_chrome:
         env["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "0"
-    # Instalamos chromium (Playwright decidirá qué artefacto usar según env)
     subprocess.run(
         ["python", "-m", "playwright", "install", "chromium", "--force"],
         check=False, capture_output=True, text=True, env=env
     )
-    return _find_any_chromium_path()
+    return _find_chrome_exec()
 
 # ---------- Captura Playwright (sync) ejecutada en hilo ----------
 @st.cache_data(show_spinner=False, ttl=60)
@@ -106,20 +103,24 @@ def capture_thumbnail_sync(
 ) -> Tuple[Optional[bytes], Optional[str]]:
     """
     Devuelve (imagen_bytes, error_str).
-    - Detecta binario (chromium o headless_shell) y lo usa.
-    - Si falta, instala y reintenta. Si buscaba headless_shell y no aparece,
-      fuerza instalación de chromium "normal" y reintenta con executable_path.
-    'cache_bust' participa de la clave de caché (evita pegarse a un None viejo).
+    - Fuerza PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL=0
+    - Busca el ejecutable 'chrome', instala si falta y lanza con executable_path
     """
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:
-        return None, f"Playwright no disponible: {str(e)[:100]}"
+        return None, f"Playwright no disponible: {str(e)[:120]}"
 
-    def _launch_and_shoot(exec_path: Optional[str] = None):
+    # Siempre preferimos chromium "chrome"
+    os.environ["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "0"
+
+    def _launch_with(exec_path: Optional[str]) -> bytes:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
-            kwargs = dict(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            kwargs = dict(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
             if exec_path:
                 kwargs["executable_path"] = exec_path
             browser = p.chromium.launch(**kwargs)
@@ -133,27 +134,28 @@ def capture_thumbnail_sync(
             context.close(); browser.close()
             return img
 
-    # 1) Intento directo (por si ya está instalado y bien)
+    # 1) Buscamos ejecutable y lanzamos
+    exec_path = _find_chrome_exec()
     try:
-        return _launch_and_shoot(None), None
+        return _launch_with(exec_path), None
     except Exception as e1:
         msg1 = str(e1)
-        # 2) Si falta ejecutable, intentar instalar lo que sea y reintentar sin path
-        if "Executable doesn't exist" in msg1 or "No usable browsers" in msg1 or "executable" in msg1.lower():
-            path = _ensure_chromium_installed(force_normal_chromium=False)
+        # 2) Instalamos y reintentamos con executable_path explícito
+        exec_path = _install_chromium(prefer_chrome=True) or _find_chrome_exec()
+        if exec_path:
             try:
-                return _launch_and_shoot(None), None
+                return _launch_with(exec_path), None
             except Exception as e2:
-                msg2 = str(e2)
-                # 3) Si insiste buscando headless_shell, forzar chromium normal y reintentar con executable_path
-                if ("chromium_headless_shell" in msg2) or ("Executable doesn't exist" in msg2):
-                    path = path or _ensure_chromium_installed(force_normal_chromium=True)
-                    try:
-                        return _launch_and_shoot(exec_path=path), None
-                    except Exception as e3:
-                        return None, f"Instalado pero no pude lanzar: {str(e3)[:200]}"
-                return None, msg2[:200]
-        return None, msg1[:200]
+                return None, f"Instalado pero no pude lanzar (chrome): {str(e2)[:200]}"
+        # 3) Último recurso: permitir headless_shell si es lo único disponible
+        os.environ["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "1"
+        exec_path = _install_chromium(prefer_chrome=False) or _find_chrome_exec()
+        if exec_path:
+            try:
+                return _launch_with(exec_path), None
+            except Exception as e3:
+                return None, f"Instalado (headless_shell) pero falló: {str(e3)[:200]}"
+        return None, f"No encontré binario tras instalar: {msg1[:160]}"
 
 @dataclass
 class Timings:
@@ -206,7 +208,7 @@ async def monitor_once(url: str, timeout: float = 10.0) -> Tuple[Dict, Optional[
         pass
     days_ssl = ssl_days_left(host) if host else None
 
-    # Miniatura en hilo (evita "Sync API dentro del bucle asyncio")
+    # Miniatura en hilo
     if st.session_state.get("thumb_on"):
         img, t_err = await asyncio.to_thread(
             capture_thumbnail_sync,
