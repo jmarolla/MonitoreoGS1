@@ -1,5 +1,8 @@
 streamlit
-httpx
+httpx[http2]
+h2
+hpack
+hyperframe
 playwright
 cryptography
 certifi
