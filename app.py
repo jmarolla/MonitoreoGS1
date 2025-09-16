@@ -112,6 +112,20 @@ def _install_chromium(prefer_chrome: bool = True) -> Optional[str]:
     LAST_PW_INSTALL_LOG = (proc.stderr or "")[-1000:] + "\n" + (proc.stdout or "")[-1000:]
     return _find_chrome_exec()
 
+def ensure_chromium() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Devuelve (exec_path, error). Intenta encontrar/instalar Chromium.
+    """
+    exec_path = _find_chrome_exec()
+    if exec_path:
+        return exec_path, None
+    for prefer in (True, False):
+        ep = _install_chromium(prefer_chrome=prefer) or _find_chrome_exec()
+        if ep:
+            return ep, None
+    err = "No encontré binario Chromium; log de instalación:\n" + (LAST_PW_INSTALL_LOG[-800:] or "(vacío)")
+    return None, err
+
 async def _screenshot_via_api(url: str, width: int, timeout: int = 12_000) -> Optional[bytes]:
     """Fallback sin navegador: mShots (WordPress) / thum.io (best effort)."""
     qurl = urllib.parse.quote(url, safe="")
@@ -373,23 +387,42 @@ def run_journey_sync(steps: list, viewport=(1280, 800), default_timeout_ms=15000
     def _log(op, detail, ok=True):
         log.append({"op": op, "detail": detail, "ok": ok})
 
-    exec_path = _find_chrome_exec()
-    if not exec_path:
-        exec_path = _install_chromium(prefer_chrome=True) or _find_chrome_exec()
-    if not exec_path:
-        os.environ["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "1"
-        exec_path = _install_chromium(prefer_chrome=False) or _find_chrome_exec()
-    if not exec_path:
-        return {"ok": False, "error": "No encontré binario Chromium", "log": log, "screens": []}
+    def _launch_browser(p, exec_path: Optional[str]):
+        """Intenta lanzar con o sin executable_path."""
+        kwargs = dict(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        if exec_path:
+            kwargs["executable_path"] = exec_path
+        return p.chromium.launch(**kwargs)
+
+    # Aseguramos binario (o recuperamos error+log)
+    exec_path, ensure_err = ensure_chromium()
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                executable_path=exec_path,
-                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            browser = None
+            try:
+                if exec_path:
+                    browser = _launch_browser(p, exec_path)
+                else:
+                    browser = _launch_browser(p, None)  # por si Playwright conoce la ruta interna
+            except Exception as e_first:
+                # Reintentos de instalación/lanzamiento (chrome y luego headless_shell)
+                for prefer in (True, False):
+                    try:
+                        os.environ["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "0" if prefer else "1"
+                        ep = _install_chromium(prefer_chrome=prefer) or _find_chrome_exec()
+                        browser = _launch_browser(p, ep if ep else None)
+                        break
+                    except Exception:
+                        browser = None
+                if browser is None:
+                    err = ensure_err or f"No pude lanzar Chromium: {e_first}"
+                    return {"ok": False, "error": err, "log": log, "screens": screens}
+
+            context = browser.new_context(
+                viewport={"width": viewport[0], "height": viewport[1]},
+                device_scale_factor=1.0
             )
-            context = browser.new_context(viewport={"width": viewport[0], "height": viewport[1]}, device_scale_factor=1.0)
             page = context.new_page()
             page.set_default_timeout(default_timeout_ms)
 
@@ -457,9 +490,9 @@ def run_journey_sync(steps: list, viewport=(1280, 800), default_timeout_ms=15000
 
             context.close(); browser.close()
             return {"ok": True, "error": None, "log": log, "screens": screens}
-
     except Exception as e:
-        return {"ok": False, "error": f"No pude lanzar Chromium: {e}", "log": log, "screens": screens}
+        err = f"No pude lanzar Chromium: {e}\n\nLog de instalación:\n{LAST_PW_INSTALL_LOG[-800:] or '(vacío)'}"
+        return {"ok": False, "error": err, "log": log, "screens": screens}
 
 # ===== Estado inicial =========================================================
 if "sites" not in st.session_state:
@@ -540,7 +573,6 @@ with st.sidebar:
 st.title("🧭 Monitor de Sitios + Journeys")
 st.caption("Miniaturas opcionales con métricas y certificado SSL. Y ahora: flujos críticos (Journeys).")
 
-# Importante: no dejes un `_ =` incompleto. Llamalo directo:
 st_autorefresh(interval=st.session_state.get("refresh_sec", 30) * 1000, key="refresh_timer")
 
 # ===== Tabs: Monitor / Journeys ==============================================
@@ -758,6 +790,9 @@ with tab_journeys:
                 st.success("✅ Journey OK")
             else:
                 st.error(f"❌ Journey falló: {result.get('error')}")
+                # Mostrar log de instalación si existe
+                with st.expander("Ver log de instalación de Playwright"):
+                    st.code((LAST_PW_INSTALL_LOG or "(vacío)")[-1200:])
 
             with st.expander("Ver logs"):
                 for row in result["log"]:
