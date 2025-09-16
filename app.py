@@ -1,6 +1,6 @@
 # app.py — Monitor de Sitios + Journeys (Playwright) — Streamlit Cloud
 # -------------------------------------------------------------------
-# - Miniaturas Playwright (instalación local ./.pw-browsers) + fallback API (mShots/thum.io)
+# - Miniaturas con Playwright (instalación local ./.pw-browsers) + fallback API (mShots/thum.io)
 # - HTTP/2 con fallback, métricas, SSL days, autorefresh, importar/exportar URLs
 # - Mejoras: badge PW/API, filtro “solo problemas”, color por SSL, reglas de contenido,
 #            histórico en memoria + CSV, alertas a Microsoft Teams con cooldown
@@ -26,7 +26,7 @@ import urllib.parse
 import csv
 import io
 import json
-import sys  # <- para usar sys.executable
+import sys  # importante: usar sys.executable para playwright
 
 import httpx
 import streamlit as st
@@ -106,7 +106,7 @@ def _install_chromium(prefer_chrome: bool = True) -> Optional[str]:
     env = os.environ.copy()
     env["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_DIR
     env["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "0" if prefer_chrome else "1"
-    # Usamos SIEMPRE el Python del runtime
+    # Usar SIEMPRE el Python del runtime
     proc = subprocess.run(
         [sys.executable, "-m", "playwright", "install", "chromium", "--force"],
         check=False, capture_output=True, text=True, env=env
@@ -677,7 +677,7 @@ with tab_monitor:
                     elif status:
                         badge = f'<span class="badge warn">⚠️ {status}</span>'
                     else:
-                        badge = '<span class="badge err">❓</span>
+                        badge = '<span class="badge err">❓</span>'  # <-- FIX: comilla cerrada
 
                     if total < 800:
                         perf_badge = f'<span class="badge ok">🚀 {total:.0f} ms</span>'
@@ -741,7 +741,8 @@ with tab_monitor:
                             with mc2:
                                 st.metric("TLS (ms)", value=f"{tls:.0f}" if tls else "—")
                                 st.metric("Total (ms)", value=f"{total:.0f}" if total else "—")
-                                st.write(ssl_badge, unsafe_allow_html=True)
+                                # FIX: usar markdown para HTML
+                                st.markdown(ssl_badge, unsafe_allow_html=True)
                             st.link_button("Abrir sitio", url, use_container_width=True)
 
                         st.markdown("</div>", unsafe_allow_html=True)
