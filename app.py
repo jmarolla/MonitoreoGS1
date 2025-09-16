@@ -26,6 +26,7 @@ import urllib.parse
 import csv
 import io
 import json
+import sys  # <- para usar sys.executable
 
 import httpx
 import streamlit as st
@@ -105,8 +106,9 @@ def _install_chromium(prefer_chrome: bool = True) -> Optional[str]:
     env = os.environ.copy()
     env["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_DIR
     env["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "0" if prefer_chrome else "1"
+    # Usamos SIEMPRE el Python del runtime
     proc = subprocess.run(
-        ["python", "-m", "playwright", "install", "chromium", "--force"],
+        [sys.executable, "-m", "playwright", "install", "chromium", "--force"],
         check=False, capture_output=True, text=True, env=env
     )
     LAST_PW_INSTALL_LOG = (proc.stderr or "")[-1000:] + "\n" + (proc.stdout or "")[-1000:]
@@ -675,7 +677,7 @@ with tab_monitor:
                     elif status:
                         badge = f'<span class="badge warn">⚠️ {status}</span>'
                     else:
-                        badge = '<span class="badge err">❓</span>'
+                        badge = '<span class="badge err">❓</span>
 
                     if total < 800:
                         perf_badge = f'<span class="badge ok">🚀 {total:.0f} ms</span>'
@@ -790,7 +792,6 @@ with tab_journeys:
                 st.success("✅ Journey OK")
             else:
                 st.error(f"❌ Journey falló: {result.get('error')}")
-                # Mostrar log de instalación si existe
                 with st.expander("Ver log de instalación de Playwright"):
                     st.code((LAST_PW_INSTALL_LOG or "(vacío)")[-1200:])
 
