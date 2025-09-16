@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
 set -e
-python -m playwright install chromium
 
+# Estandarizamos la carpeta para que el código la encuentre
+export PLAYWRIGHT_BROWSERS_PATH="./.pw-browsers"
+
+# Instala Chromium + dependencias de sistema (en el build)
+python -m playwright install --with-deps chromium
